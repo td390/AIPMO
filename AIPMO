@@ -135,7 +135,115 @@ function isJiraQuestion(text) {
 }
 
 // ============================================================================
-// 2.3) AI INTENT DETECTION & SMART CONFIRMATION
+// 2.3) ENHANCED STATISTICS GENERATOR
+// ============================================================================
+function generateEnhancedStats(jiraResults) {
+  const statusCount = {};
+  const priorityCount = {};
+  const assigneeCount = {};
+  const typeCount = {};
+  const projectCount = {};
+  
+  let overdueCount = 0;
+  let upcomingCount = 0; // Sắp đến hạn < 7 ngày
+  let noDueDateCount = 0;
+  
+  const now = new Date();
+  const sevenDaysLater = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+  
+  jiraResults.forEach(issue => {
+    // Existing counts
+    statusCount[issue.status] = (statusCount[issue.status] || 0) + 1;
+    priorityCount[issue.priority] = (priorityCount[issue.priority] || 0) + 1;
+    const assignee = issue.assignee || 'Unassigned';
+    assigneeCount[assignee] = (assigneeCount[assignee] || 0) + 1;
+    const issueType = issue.type || 'Unknown';
+    typeCount[issueType] = (typeCount[issueType] || 0) + 1;
+    
+    // ✅ NEW: Project breakdown
+    const projectName = issue.projectName || 'Unknown';
+    projectCount[projectName] = (projectCount[projectName] || 0) + 1;
+    
+    // ✅ NEW: Deadline analysis
+    if (issue.duedate) {
+      const dueDate = new Date(issue.duedate);
+      if (dueDate < now) {
+        overdueCount++;
+      } else if (dueDate <= sevenDaysLater) {
+        upcomingCount++;
+      }
+    } else {
+      noDueDateCount++;
+    }
+  });
+
+  return {
+    status: statusCount,
+    priority: priorityCount,
+    assignee: assigneeCount,
+    type: typeCount,
+    project: projectCount,
+    deadline: {
+      overdue: overdueCount,
+      upcoming: upcomingCount,
+      noDueDate: noDueDateCount,
+      total: jiraResults.length
+    }
+  };
+}
+
+function buildEnhancedPrompt(jiraResults, enhancedMessage, stats) {
+  const { status, priority, assignee, project, deadline } = stats;
+  
+  let prompt = `Phân tích dự án với ${jiraResults.length} issues dựa trên câu hỏi: "${enhancedMessage}"
+
+📊 THỐNG KÊ CHI TIẾT:
+
+🎯 Trạng thái:
+${Object.entries(status).map(([k,v]) => `  • ${k}: ${v} (${Math.round(v/jiraResults.length*100)}%)`).join('\n')}
+
+⚡ Ưu tiên:
+${Object.entries(priority).map(([k,v]) => `  • ${k}: ${v}`).join('\n')}
+
+👥 Phân công:
+${Object.entries(assignee).slice(0, 5).map(([k,v]) => `  • ${k}: ${v} tasks`).join('\n')}${Object.keys(assignee).length > 5 ? `\n  • ... và ${Object.keys(assignee).length - 5} người khác` : ''}`;
+
+  // ✅ Add project breakdown if multiple projects
+  if (Object.keys(project).length > 1) {
+    prompt += `\n\n📁 Phân bổ theo dự án:
+${Object.entries(project).map(([k,v]) => `  • ${k}: ${v} issues (${Math.round(v/jiraResults.length*100)}%)`).join('\n')}`;
+  }
+
+  // ✅ Add deadline warnings
+  if (deadline.overdue > 0 || deadline.upcoming > 0) {
+    prompt += `\n\n⏰ CẢNH BÁO DEADLINE:`;
+    if (deadline.overdue > 0) {
+      prompt += `\n  🔴 Quá hạn: ${deadline.overdue} issues (${Math.round(deadline.overdue/jiraResults.length*100)}%)`;
+    }
+    if (deadline.upcoming > 0) {
+      prompt += `\n  🟡 Sắp đến hạn (7 ngày): ${deadline.upcoming} issues (${Math.round(deadline.upcoming/jiraResults.length*100)}%)`;
+    }
+    if (deadline.noDueDate > 0) {
+      prompt += `\n  ⚪ Chưa set deadline: ${deadline.noDueDate} issues`;
+    }
+  }
+
+  prompt += `\n\nHãy trả lời ngắn gọn theo format:
+
+▪ Tình hình:
+[Đánh giá tổng quan, highlight issues quá hạn nếu có]
+
+▪ Vấn đề:
+[Rủi ro về deadline, bottleneck, issues critical cần chú ý]
+
+▪ Đề xuất:
+[Hành động cụ thể để cải thiện tình hình]`;
+
+  return prompt;
+}
+
+// ============================================================================
+// 2.4) AI INTENT DETECTION & SMART CONFIRMATION
 // ============================================================================
 
 async function handleNaturalClarification(env, userResponse, clarificationData, chatId, mode) {
@@ -147,23 +255,120 @@ async function handleNaturalClarification(env, userResponse, clarificationData, 
   
   // Update entity based on current missing info
   if (currentMissingInfo === 'project') {
+    // Check if user wants to search
+    const searchKeywords = ['tìm kiếm', 'search', 'tìm', 'tim kiem'];
+    const wantsSearch = searchKeywords.some(kw => userResponse.toLowerCase().includes(kw));
+    
     // Parse project selection
     const projectMatch = userResponse.match(/^\d+$/);
     if (projectMatch) {
       const index = parseInt(projectMatch[0]) - 1;
-      if (availableProjects && index < availableProjects.length) {
-        updatedEntities.projectKey = availableProjects[index].key;
-      } else if (index === availableProjects.length) {
-        updatedEntities.projectKey = ''; // All projects
+      
+      // Check for search options (SEARCH or SEARCH_AGAIN)
+      const searchResults = entities.searchResults || availableProjects;
+      
+      if (searchResults && index < searchResults.length) {
+        updatedEntities.projectKey = searchResults[index].key;
+        updatedEntities.projectName = searchResults[index].name;
+        updatedMissingInfo = updatedMissingInfo.filter(info => info !== 'project');
+      } else if (index === searchResults.length) {
+        // All projects option
+        updatedEntities.projectKey = '';
+        updatedMissingInfo = updatedMissingInfo.filter(info => info !== 'project');
+      } else if (index === searchResults.length + 1) {
+        // Search option selected
+        const searchPrompt = '🔎 **Nhập tên hoặc từ khóa dự án bạn muốn tìm:**\n\nVí dụ: "quản lý", "mobile app", "ABC"...';
+        
+        addToConversationHistory(chatId, 'assistant', searchPrompt, mode);
+        
+        return {
+          success: true,
+          response: searchPrompt,
+          needsClarification: true,
+          clarificationStep: 'awaiting_project_search',
+          clarificationData: {
+            ...clarificationData,
+            currentMissingInfo: 'project_search_input'
+          },
+          mode: mode
+        };
       }
+    } else if (wantsSearch) {
+      // User typed "tìm kiếm" or similar
+      const searchPrompt = '🔎 **Nhập tên hoặc từ khóa dự án bạn muốn tìm:**\n\nVí dụ: "quản lý", "mobile app", "ABC"...';
+      
+      addToConversationHistory(chatId, 'assistant', searchPrompt, mode);
+      
+      return {
+        success: true,
+        response: searchPrompt,
+        needsClarification: true,
+        clarificationStep: 'awaiting_project_search',
+        clarificationData: {
+          ...clarificationData,
+          currentMissingInfo: 'project_search_input'
+        },
+        mode: mode
+      };
     } else {
-      // Try to match project key in text
-      const projectKeyMatch = userResponse.match(/\b([A-Z][A-Z0-9]{1,9})\b/);
-      if (projectKeyMatch) {
-        updatedEntities.projectKey = projectKeyMatch[1];
+      // User typed project name/key directly - try to search
+      const searchResults = await searchProjects(env, userResponse);
+      
+      if (searchResults && searchResults.length > 0) {
+        const bestMatch = findBestProjectMatch(searchResults, userResponse);
+        
+        if (bestMatch) {
+          updatedEntities.projectKey = bestMatch.key;
+          updatedEntities.projectName = bestMatch.name;
+          updatedMissingInfo = updatedMissingInfo.filter(info => info !== 'project');
+          
+          console.log(`[Clarification Search] Found: ${bestMatch.name} (${bestMatch.key})`);
+        } else {
+          // Show search results for user to choose
+          updatedEntities.searchResults = searchResults;
+        }
+      } else {
+        // Try to match project key pattern
+        const projectKeyMatch = userResponse.match(/\b([A-Z][A-Z0-9]{1,9})\b/);
+        if (projectKeyMatch) {
+          updatedEntities.projectKey = projectKeyMatch[1];
+          updatedMissingInfo = updatedMissingInfo.filter(info => info !== 'project');
+        }
       }
     }
-    updatedMissingInfo = updatedMissingInfo.filter(info => info !== 'project');
+  } else if (currentMissingInfo === 'project_search_input') {
+    // User entered search keywords
+    const searchResults = await searchProjects(env, userResponse);
+    
+    if (searchResults && searchResults.length > 0) {
+      updatedEntities.searchResults = searchResults;
+      
+      // If only 1 result, auto-select it
+      if (searchResults.length === 1) {
+        updatedEntities.projectKey = searchResults[0].key;
+        updatedEntities.projectName = searchResults[0].name;
+        updatedMissingInfo = updatedMissingInfo.filter(info => info !== 'project');
+        
+        console.log(`[Search] Auto-selected single result: ${searchResults[0].name}`);
+      } else {
+        // Show results for selection
+        currentMissingInfo = 'project'; // Back to project selection with new results
+      }
+    } else {
+      // No results found
+      addToConversationHistory(chatId, 'user', userResponse, mode);
+      const noResultMsg = `❌ Không tìm thấy dự án nào với từ khóa "${userResponse}".\n\n💡 Thử lại với từ khóa khác hoặc chọn "Tất cả dự án"`;
+      addToConversationHistory(chatId, 'assistant', noResultMsg, mode);
+      
+      return {
+        success: true,
+        response: noResultMsg,
+        needsClarification: true,
+        clarificationStep: 'awaiting_project_search',
+        clarificationData: clarificationData,
+        mode: mode
+      };
+    }
     
   } else if (currentMissingInfo === 'queryType') {
     // Parse query type selection
@@ -288,38 +493,11 @@ async function handleNaturalClarification(env, userResponse, clarificationData, 
   const jql = await generateJQL(env, enhancedMessage, projectKey || '');
   const jiraResults = await executeJQL(env, jql);
   
-  const statusCount = {};
-  const priorityCount = {};
-  const assigneeCount = {};
-  const typeCount = {};
-  
-  jiraResults.forEach(issue => {
-    statusCount[issue.status] = (statusCount[issue.status] || 0) + 1;
-    priorityCount[issue.priority] = (priorityCount[issue.priority] || 0) + 1;
-    const assignee = issue.assignee || 'Unassigned';
-    assigneeCount[assignee] = (assigneeCount[assignee] || 0) + 1;
-    const issueType = issue.type || 'Unknown';
-    typeCount[issueType] = (typeCount[issueType] || 0) + 1;
-  });
+  // ✅ Use enhanced stats generator
+  const stats = generateEnhancedStats(jiraResults);
 
-  let prompt = `Phân tích dự án với ${jiraResults.length} issues dựa trên câu hỏi: "${enhancedMessage}"
-
-THỐNG KÊ:
-- Trạng thái: ${Object.entries(statusCount).map(([k,v]) => `${k}(${v})`).join(', ')}
-- Ưu tiên: ${Object.entries(priorityCount).map(([k,v]) => `${k}(${v})`).join(', ')}
-- Phân công: ${Object.entries(assigneeCount).map(([k,v]) => `${k}(${v})`).join(', ')}
-
-Hãy trả lời ngắn gọn theo format:
-
-▪ Tình hình:
-[nội dung tình hình]
-
-▪ Vấn đề:
-[nội dung vấn đề]
-
-▪ Đề xuất:
-[nội dung đề xuất]`;
-
+  // ✅ Use enhanced prompt builder
+  const prompt = buildEnhancedPrompt(jiraResults, enhancedMessage, stats);
   const answer = await askGrok(env, prompt);
   
   // Add assistant response to history
@@ -330,12 +508,7 @@ Hãy trả lời ngắn gọn theo format:
     response: answer, 
     jql: jql, 
     results: jiraResults,
-    statistics: {
-      status: statusCount,
-      priority: priorityCount,
-      assignee: assigneeCount,
-      type: typeCount
-    },
+    statistics: stats, // ✅ Return enhanced stats
     mode: 'natural'
   };
 }
@@ -344,56 +517,128 @@ async function analyzeUserIntent(env, message, conversationHistory) {
   // Tạo context từ lịch sử hội thoại
   let contextPrompt = '';
   if (conversationHistory && conversationHistory.messages.length > 0) {
-    contextPrompt = '\n\nLịch sử hội thoại gần đây:\n';
+    contextPrompt = '\n\n📋 Lịch sử hội thoại gần đây:\n';
     conversationHistory.messages.slice(-5).forEach(msg => {
-      contextPrompt += `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}\n`;
+      contextPrompt += `${msg.role === 'user' ? '👤 User' : '🤖 Assistant'}: ${msg.content}\n`;
     });
   }
   
-  const prompt = `Bạn là AI phân tích ý định người dùng về các câu hỏi dự án Jira.
+  const prompt = `Bạn là AI phân tích ý định của Giám đốc/Leader khi hỏi về dự án Jira.
+
+🎯 NGUYÊN TẮC PHÂN TÍCH:
+1. Giám đốc thường hỏi chung chung, ngắn gọn → cần đoán context thông minh
+2. Ưu tiên hiểu "ý định thực sự" hơn là "từ khóa chính xác"
+3. Nếu không rõ thời gian → mặc định 30 ngày gần đây (quan tâm hiện tại)
+4. Nếu không rõ dự án → hỏi lại hoặc đề xuất "tất cả dự án"
+5. Câu hỏi mơ hồ về "tình hình", "thế nào" → mặc định hỏi về tiến độ (progress)
 
 ${contextPrompt}
 
 Câu hỏi mới: "${message}"
 
-Hãy phân tích và trả về JSON:
+🧠 PHÂN TÍCH TƯ DUY GIÁM ĐỐC:
+- "Dự án thế nào?" → Tiến độ tổng quan
+- "Có vấn đề gì không?" → Rủi ro + bugs
+- "Team làm việc ra sao?" → Workload + tasks
+- "Chất lượng sao?" → Bugs + quality
+- Hỏi về người cụ thể → Tasks của người đó
+- Hỏi về module/epic → Filter theo component
+
+Hãy trả về JSON:
 {
   "intent": "query_project|unclear|general_chat",
   "confidence": 0.0-1.0,
   "entities": {
-    "projectKey": "ABC hoặc null",
-    "timeframe": "30d|3m|6m|sprint|null",
-    "queryType": "progress|risk|quality|tasks|null",
-    "specificIssue": "ABC-123 hoặc null"
+    "projectKey": "ABC hoặc null (nếu không rõ → null, sẽ hỏi sau)",
+    "timeframe": "30d|3m|6m|sprint|null (mặc định 30d nếu hỏi về hiện tại)",
+    "queryType": "progress|risk|quality|tasks|overview|null",
+    "specificIssue": "ABC-123 hoặc null",
+    "assignee": "Tên người nếu có hoặc null",
+    "urgency": "high|medium|low (đánh giá mức độ khẩn cấp từ ngữ điệu)"
   },
   "missingInfo": ["project", "timeframe", "queryType"],
-  "suggestedQuestion": "Câu hỏi xác nhận ngắn gọn"
+  "suggestedQuestion": "Câu hỏi xác nhận ngắn gọn, phù hợp vai Giám đốc",
+  "reasoning": "Giải thích ngắn tại sao phân tích như vậy"
 }
 
-Lưu ý:
-- confidence > 0.7: đủ thông tin để query
-- confidence 0.4-0.7: cần xác nhận
-- confidence < 0.4: cần hỏi lại rõ hơn
-- Sử dụng lịch sử để đoán context
-- suggestedQuestion phải ngắn gọn, thân thiện`;
+⚡ QUY TẮC CONFIDENCE:
+- > 0.7: Đủ thông tin, thực thi ngay (có queryType rõ ràng)
+- 0.4-0.7: Cần xác nhận 1-2 thông tin (thiếu project hoặc timeframe)
+- < 0.4: Câu hỏi quá mơ hồ, cần hỏi lại
+
+📌 LƯU Ý ĐẶC BIỆT:
+- Nếu hỏi "tình hình", "overview", "báo cáo" → queryType = "overview" (confidence cao)
+- Nếu có từ "gấp", "urgent", "khẩn" → urgency = "high"
+- Sử dụng lịch sử để đoán context liên tục (user có thể hỏi tiếp về cùng topic)`;
 
   try {
     const response = await askGrok(env, prompt);
     const jsonMatch = response.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
+      const parsed = JSON.parse(jsonMatch[0]);
+      
+      // Smart defaults nếu AI không set
+      if (!parsed.entities.timeframe && parsed.intent === 'query_project') {
+        parsed.entities.timeframe = '30d'; // Default 30 ngày nếu không rõ
+      }
+      if (!parsed.entities.queryType && (parsed.confidence >= 0.4)) {
+        parsed.entities.queryType = 'overview'; // Default overview nếu mơ hồ
+      }
+      
+      // 🔍 SMART PROJECT SEARCH: Extract và tìm kiếm tên dự án từ message
+      if (!parsed.entities.projectKey || parsed.entities.projectKey === 'null') {
+        const extractedName = extractProjectNameFromMessage(message);
+        
+        if (extractedName) {
+          // Tìm kiếm dự án bằng API
+          const searchResults = await searchProjects(env, extractedName);
+          
+          if (searchResults && searchResults.length > 0) {
+            // Tìm project phù hợp nhất
+            const bestMatch = findBestProjectMatch(searchResults, extractedName);
+            
+            if (bestMatch) {
+              parsed.entities.projectKey = bestMatch.key;
+              parsed.entities.projectName = bestMatch.name;
+              parsed.entities.searchResults = searchResults; // Lưu kết quả tìm kiếm để user chọn nếu cần
+              
+              // Tăng confidence nếu tìm thấy dự án
+              if (parsed.confidence < 0.7) {
+                parsed.confidence = Math.min(0.8, parsed.confidence + 0.2);
+              }
+              
+              // Bỏ 'project' khỏi missingInfo
+              if (parsed.missingInfo) {
+                parsed.missingInfo = parsed.missingInfo.filter(info => info !== 'project');
+              }
+              
+              console.log(`[Smart Search] Found project: ${bestMatch.name} (${bestMatch.key}) for query: "${extractedName}"`);
+            }
+          }
+        }
+      }
+      
+      return parsed;
     }
   } catch (e) {
     console.error('Intent analysis error:', e);
   }
   
-  // Fallback
+  // Fallback với smart defaults
   return {
-    intent: 'unclear',
-    confidence: 0.3,
-    entities: {},
-    missingInfo: ['project', 'timeframe', 'queryType'],
-    suggestedQuestion: 'Bạn muốn hỏi về dự án nào và vấn đề gì?'
+    intent: 'query_project',
+    confidence: 0.5,
+    entities: {
+      projectKey: null,
+      timeframe: '30d', // Mặc định 30 ngày
+      queryType: 'overview', // Mặc định tổng quan
+      specificIssue: null,
+      assignee: null,
+      urgency: 'medium'
+    },
+    missingInfo: ['project'],
+    suggestedQuestion: 'Bạn muốn xem tổng quan dự án nào? (hoặc tất cả dự án)',
+    reasoning: 'Fallback - đề xuất xem tổng quan 30 ngày gần đây'
   };
 }
 
@@ -408,17 +653,44 @@ async function generateSmartConfirmation(env, intentData, availableProjects) {
   // Priority order: project -> queryType -> timeframe
   if (missingInfo.includes('project')) {
     currentMissingInfo = 'project';
-    confirmationText = '📊 **Bạn muốn hỏi về dự án nào?**\n\n';
     
-    if (availableProjects && availableProjects.length > 0) {
-      availableProjects.slice(0, 5).forEach((p, i) => {
+    // Check if we have search results from smart search
+    if (entities.searchResults && entities.searchResults.length > 0) {
+      confirmationText = '� **Tôi tìm thấy các dự án phù hợp:**\n\n';
+      
+      entities.searchResults.slice(0, 5).forEach((p, i) => {
         confirmationText += `${i + 1}. ${p.name} (${p.key})\n`;
         options.push({ id: p.key, text: `${p.name} (${p.key})`, type: 'project' });
       });
       
-      const allIndex = Math.min(5, availableProjects.length) + 1;
-      confirmationText += `${allIndex}. Tất cả dự án\n`;
+      if (entities.searchResults.length > 5) {
+        confirmationText += `\n... và ${entities.searchResults.length - 5} dự án khác\n`;
+      }
+      
+      const nextIndex = Math.min(5, entities.searchResults.length) + 1;
+      confirmationText += `${nextIndex}. Tất cả dự án\n`;
+      confirmationText += `${nextIndex + 1}. 🔎 Tìm kiếm lại bằng từ khóa khác\n`;
+      
       options.push({ id: 'ALL', text: 'Tất cả dự án', type: 'project' });
+      options.push({ id: 'SEARCH_AGAIN', text: 'Tìm kiếm lại', type: 'search' });
+      
+    } else {
+      // Fallback: hiển thị danh sách dự án có sẵn
+      confirmationText = '�📊 **Bạn muốn hỏi về dự án nào?**\n\n';
+      
+      if (availableProjects && availableProjects.length > 0) {
+        availableProjects.slice(0, 5).forEach((p, i) => {
+          confirmationText += `${i + 1}. ${p.name} (${p.key})\n`;
+          options.push({ id: p.key, text: `${p.name} (${p.key})`, type: 'project' });
+        });
+        
+        const allIndex = Math.min(5, availableProjects.length) + 1;
+        confirmationText += `${allIndex}. Tất cả dự án\n`;
+        confirmationText += `${allIndex + 1}. 🔎 Tìm kiếm dự án theo tên\n`;
+        
+        options.push({ id: 'ALL', text: 'Tất cả dự án', type: 'project' });
+        options.push({ id: 'SEARCH', text: 'Tìm kiếm dự án', type: 'search' });
+      }
     }
     
   } else if (missingInfo.includes('queryType')) {
@@ -531,37 +803,71 @@ async function processChatMessage(env, message, opts = {}) {
         const jql = await generateJQL(env, enhancedMessage, entities.projectKey || '');
         const jiraResults = await executeJQL(env, jql);
         
-        const statusCount = {};
-        const priorityCount = {};
-        const assigneeCount = {};
-        const typeCount = {};
-        
-        jiraResults.forEach(issue => {
-          statusCount[issue.status] = (statusCount[issue.status] || 0) + 1;
-          priorityCount[issue.priority] = (priorityCount[issue.priority] || 0) + 1;
-          const assignee = issue.assignee || 'Unassigned';
-          assigneeCount[assignee] = (assigneeCount[assignee] || 0) + 1;
-          const issueType = issue.type || 'Unknown';
-          typeCount[issueType] = (typeCount[issueType] || 0) + 1;
-        });
+        // ✅ Use enhanced stats generator
+        const stats = generateEnhancedStats(jiraResults);
+        const { status: statusCount, priority: priorityCount, assignee: assigneeCount, type: typeCount } = stats;
 
-        let prompt = `Phân tích dự án với ${jiraResults.length} issues dựa trên câu hỏi: "${message}"
+        // Tạo prompt phù hợp với queryType
+        let prompt = '';
+        const queryType = entities.queryType || 'overview';
+        
+        if (queryType === 'overview') {
+          // ✅ Use enhanced prompt for overview
+          prompt = buildEnhancedPrompt(jiraResults, message, stats);
+        } else if (queryType === 'risk') {
+          const highPriority = (priorityCount['Highest'] || 0) + (priorityCount['High'] || 0) + (priorityCount['Critical'] || 0);
+          prompt = `Phân tích RỦI RO dự án với ${jiraResults.length} issues:
+
+🚨 ƯU TIÊN CAO: ${highPriority} issues
+📊 Trạng thái: ${Object.entries(statusCount).map(([k,v]) => `${k}(${v})`).join(', ')}
+
+Câu hỏi: "${message}"
+
+Trả lời ngắn gọn:
+⚠️ RỦI RO CHÍNH:
+✅ ĐỀ XUẤT GIẢM THIỂU:`;
+
+        } else if (queryType === 'quality') {
+          const bugs = typeCount['Bug'] || 0;
+          prompt = `Phân tích CHẤT LƯỢNG với ${jiraResults.length} issues:
+
+🐛 Bugs: ${bugs}
+📊 Trạng thái bugs: ${Object.entries(statusCount).map(([k,v]) => `${k}(${v})`).join(', ')}
+
+Câu hỏi: "${message}"
+
+Trả lời ngắn gọn:
+🐞 TÌNH HÌNH BUGS:
+✅ ĐỀ XUẤT:`;
+
+        } else if (queryType === 'tasks') {
+          prompt = `Phân tích CÔNG VIỆC với ${jiraResults.length} tasks:
+
+👥 Phân công: ${Object.entries(assigneeCount).slice(0, 3).map(([k,v]) => `${k}(${v})`).join(', ')}
+📊 Trạng thái: ${Object.entries(statusCount).map(([k,v]) => `${k}(${v})`).join(', ')}
+
+Câu hỏi: "${message}"
+
+Trả lời ngắn gọn:
+📋 TÌNH HÌNH TASKS:
+⚡ WORKLOAD:
+✅ ĐỀ XUẤT:`;
+
+        } else {
+          // Progress hoặc default
+          prompt = `Phân tích TIẾN ĐỘ với ${jiraResults.length} issues:
 
 THỐNG KÊ:
 - Trạng thái: ${Object.entries(statusCount).map(([k,v]) => `${k}(${v})`).join(', ')}
 - Ưu tiên: ${Object.entries(priorityCount).map(([k,v]) => `${k}(${v})`).join(', ')}
-- Phân công: ${Object.entries(assigneeCount).map(([k,v]) => `${k}(${v})`).join(', ')}
 
-Hãy trả lời ngắn gọn theo format:
+Câu hỏi: "${message}"
 
+Trả lời ngắn gọn:
 ▪ Tình hình:
-[nội dung tình hình]
-
 ▪ Vấn đề:
-[nội dung vấn đề]
-
-▪ Đề xuất:
-[nội dung đề xuất]`;
+▪ Đề xuất:`;
+        }
 
         const answer = await askGrok(env, prompt);
         
@@ -573,12 +879,7 @@ Hãy trả lời ngắn gọn theo format:
           response: answer, 
           jql: jql, 
           results: jiraResults,
-          statistics: {
-            status: statusCount,
-            priority: priorityCount,
-            assignee: assigneeCount,
-            type: typeCount
-          },
+          statistics: stats, // ✅ Return enhanced stats
           mode: 'natural'
         };
       }
@@ -667,41 +968,11 @@ Hãy trả lời ngắn gọn theo format:
     const jql = await generateJQL(env, message, projectKey);
     const jiraResults = await executeJQL(env, jql);
     
-    // Tạo dữ liệu thống kê
-    const statusCount = {};
-    const priorityCount = {};
-    const assigneeCount = {};
-    const typeCount = {};
-    
-    jiraResults.forEach(issue => {
-      statusCount[issue.status] = (statusCount[issue.status] || 0) + 1;
-      priorityCount[issue.priority] = (priorityCount[issue.priority] || 0) + 1;
-      const assignee = issue.assignee || 'Unassigned';
-      assigneeCount[assignee] = (assigneeCount[assignee] || 0) + 1;
-      const issueType = issue.type || 'Unknown';
-      typeCount[issueType] = (typeCount[issueType] || 0) + 1;
-    });
+    // ✅ Use enhanced stats generator
+    const stats = generateEnhancedStats(jiraResults);
 
-    // Tạo prompt cho AI với dữ liệu thống kê
-    let prompt = `Phân tích dự án với ${jiraResults.length} issues dựa trên câu hỏi: "${message}"
-
-THỐNG KÊ:
-- Trạng thái: ${Object.entries(statusCount).map(([k,v]) => `${k}(${v})`).join(', ')}
-- Ưu tiên: ${Object.entries(priorityCount).map(([k,v]) => `${k}(${v})`).join(', ')}
-- Phân công: ${Object.entries(assigneeCount).map(([k,v]) => `${k}(${v})`).join(', ')}
-
-Hãy trả lời ngắn gọn theo format:
-
-▪ Tình hình:
-[nội dung tình hình]
-
-▪ Vấn đề:
-[nội dung vấn đề]
-
-▪ Đề xuất:
-[nội dung đề xuất]
-
-Mỗi đầu mục phải xuống dòng riêng. Không cần viết "Dưới đây là..." hay giới thiệu dài dòng.`;
+    // ✅ Use enhanced prompt builder
+    const prompt = buildEnhancedPrompt(jiraResults, message, stats);
 
     const answer = await askGrok(env, prompt);
     return { 
@@ -709,11 +980,7 @@ Mỗi đầu mục phải xuống dòng riêng. Không cần viết "Dưới đ�
       response: answer, 
       jql: jql, 
       results: jiraResults,
-      statistics: {
-        status: statusCount,
-        priority: priorityCount,
-        assignee: assigneeCount
-      }
+      statistics: stats // ✅ Return enhanced stats
     };
   } catch (error) {
     return { 
@@ -756,43 +1023,219 @@ async function generateJQL(env, message, defaultProjectKey) {
   return `${baseJql} ORDER BY created DESC`;
 }
 
+// ============================================================================
+// PROJECT SEARCH - Tìm kiếm dự án thông minh cho Giám đốc
+// ============================================================================
+
+/**
+ * Tìm kiếm dự án theo từ khóa sử dụng Atlassian API
+ * @param {Object} env - Environment variables
+ * @param {string} searchString - Từ khóa tìm kiếm (có thể là tên dự án không chính xác)
+ * @returns {Array} Danh sách dự án phù hợp với key, name, description
+ */
+async function searchProjects(env, searchString) {
+  if (!searchString || !searchString.trim()) {
+    // Nếu không có từ khóa, trả về tất cả dự án
+    return await getAllProjects(env);
+  }
+
+  const BASE_JIRA = envJiraBase(env);
+  const query = encodeURIComponent(String(searchString).trim());
+  const API_URL = `${BASE_JIRA}/rest/api/3/project/search?query=${query}`;
+
+  try {
+    const r = await fetch(API_URL, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+        'Authorization': 'Basic ' + btoa(`${atlassianEmail(env)}:${env.ATLASSIAN_API_TOKEN}`)
+      }
+    });
+
+    if (!r.ok) {
+      console.error(`Project search failed: ${r.status}`);
+      // Fallback: trả về tất cả dự án nếu search fail
+      return await getAllProjects(env);
+    }
+
+    const data = await r.json();
+    
+    if (!data.values || !Array.isArray(data.values)) {
+      return [];
+    }
+
+    // Trả về danh sách dự án với thông tin cần thiết
+    return data.values.map(project => ({
+      key: project.key,
+      name: project.name,
+      description: project.description || '',
+      projectTypeKey: project.projectTypeKey || 'software',
+      id: project.id
+    }));
+
+  } catch (error) {
+    console.error('searchProjects error:', error);
+    // Fallback: trả về tất cả dự án
+    return await getAllProjects(env);
+  }
+}
+
+/**
+ * Lấy tất cả dự án (fallback khi search fail)
+ */
+async function getAllProjects(env) {
+  const BASE_JIRA = envJiraBase(env);
+  const API_URL = `${BASE_JIRA}/rest/api/3/project`;
+
+  try {
+    const r = await fetch(API_URL, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+        'Authorization': 'Basic ' + btoa(`${atlassianEmail(env)}:${env.ATLASSIAN_API_TOKEN}`)
+      }
+    });
+
+    if (!r.ok) {
+      return [];
+    }
+
+    const data = await r.json();
+    
+    if (!Array.isArray(data)) {
+      return [];
+    }
+
+    return data.map(project => ({
+      key: project.key,
+      name: project.name,
+      description: project.description || '',
+      projectTypeKey: project.projectTypeKey || 'software',
+      id: project.id
+    }));
+
+  } catch (error) {
+    console.error('getAllProjects error:', error);
+    return [];
+  }
+}
+
+/**
+ * Extract tên dự án từ câu hỏi của user (smart parsing)
+ * VD: "dự án ABC thế nào" -> "ABC"
+ * VD: "project management system" -> "management system"
+ */
+function extractProjectNameFromMessage(message) {
+  if (!message) return null;
+  
+  const text = String(message).trim();
+  
+  // Pattern 1: "dự án X", "project X"
+  const pattern1 = /(?:dự án|project|d\s*ự\s*á\s*n)\s+([A-Za-z0-9\s-]+?)(?:\s+(?:thế nào|như thế nào|ra sao|có vấn đề|tình hình)|$)/i;
+  const match1 = text.match(pattern1);
+  if (match1 && match1[1]) {
+    return match1[1].trim();
+  }
+  
+  // Pattern 2: Project key format (ABC, ABC-DEF, etc.)
+  const pattern2 = /\b([A-Z][A-Z0-9]{1,9})\b/;
+  const match2 = text.match(pattern2);
+  if (match2 && match2[1]) {
+    return match2[1];
+  }
+  
+  // Pattern 3: Tên dự án trong ngoặc kép
+  const pattern3 = /["']([^"']+)["']/;
+  const match3 = text.match(pattern3);
+  if (match3 && match3[1]) {
+    return match3[1].trim();
+  }
+  
+  return null;
+}
+
+/**
+ * Tìm dự án tốt nhất từ kết quả search
+ * Ưu tiên: exact match key > partial name match > first result
+ */
+function findBestProjectMatch(searchResults, searchString) {
+  if (!searchResults || searchResults.length === 0) {
+    return null;
+  }
+  
+  const query = String(searchString || '').toLowerCase().trim();
+  
+  // 1. Exact match với project key
+  const exactKeyMatch = searchResults.find(p => p.key.toLowerCase() === query);
+  if (exactKeyMatch) {
+    return exactKeyMatch;
+  }
+  
+  // 2. Exact match với tên dự án
+  const exactNameMatch = searchResults.find(p => p.name.toLowerCase() === query);
+  if (exactNameMatch) {
+    return exactNameMatch;
+  }
+  
+  // 3. Partial match với tên dự án (chứa từ khóa)
+  const partialMatch = searchResults.find(p => 
+    p.name.toLowerCase().includes(query) || 
+    p.key.toLowerCase().includes(query)
+  );
+  if (partialMatch) {
+    return partialMatch;
+  }
+  
+  // 4. Fallback: trả về kết quả đầu tiên
+  return searchResults[0];
+}
+
 
 
 async function executeJQL(env, jql) {
   const BASE_JIRA = envJiraBase(env);
-  const API_BASE_URL = `${BASE_JIRA}/rest/api/3/search/jql`;
+  const API_URL = `${BASE_JIRA}/rest/api/3/search/jql`;
 
   try {
     const m = jql.match(/\bLIMIT\s+(\d+)/i);
-    const maxResults = m ? Math.max(1, Math.min(1000, parseInt(m[1], 10))) : 1000;
+    // Tăng maxResults lên 5000 theo khả năng của Atlassian API
+    // Theo docs: maxResults default 50, max 5000 (GET), hoặc pagination với POST
+    const maxResults = m ? Math.max(1, Math.min(5000, parseInt(m[1], 10))) : 5000;
     const cleanJql = jql.replace(/\bLIMIT\s+\d+/ig, '').trim();
 
     let allResults = [];
     let nextPageToken = null;
-    const batchSize = 100; // Lấy từng batch 100 issues
+    const batchSize = 100; // Lấy từng batch 100 issues để tránh timeout
 
-    // Loop để lấy hết tất cả tickets sử dụng nextPageToken
+    // Loop để lấy hết tất cả tickets sử dụng nextPageToken (pagination)
     while (true) {
-      // Tạo URL với query parameters
-      const params = new URLSearchParams({
+      // Request body cho API POST /search/jql
+      const requestBody = {
         jql: cleanJql,
-        maxResults: batchSize.toString(),
-        fields: 'key,summary,status,priority,assignee'
-      });
+        maxResults: batchSize,
+        fields: [
+          'key', 'summary', 'status', 'priority', 'assignee', 
+          'created', 'updated', 'issuetype',
+          'duedate',      // ✅ THÊM: Deadline để phân tích quá hạn
+          'project',      // ✅ THÊM: Project details (name, key)
+          'resolution',   // ✅ THÊM: Đã resolved chưa
+          'labels'        // ✅ THÊM: Labels/tags metadata
+        ]
+      };
 
-      // Thêm nextPageToken nếu có
+      // Thêm nextPageToken nếu có (để lấy trang tiếp theo)
       if (nextPageToken) {
-        params.append('nextPageToken', nextPageToken);
+        requestBody.nextPageToken = nextPageToken;
       }
 
-      const API_URL = `${API_BASE_URL}?${params.toString()}`;
-
       const r = await fetch(API_URL, {
-        method: 'GET',
+        method: 'POST',
         headers: {
           'Accept': 'application/json',
+          'Content-Type': 'application/json',
           'Authorization': 'Basic ' + btoa(`${atlassianEmail(env)}:${env.ATLASSIAN_API_TOKEN}`)
-        }
+        },
+        body: JSON.stringify(requestBody)
       });
 
       if (!r.ok) {
@@ -810,16 +1253,26 @@ async function executeJQL(env, jql) {
         summary: issue.fields.summary,
         status: issue.fields.status?.name,
         priority: issue.fields.priority ? issue.fields.priority.name : 'Not set',
-        assignee: issue.fields.assignee ? issue.fields.assignee.displayName : null
+        assignee: issue.fields.assignee ? issue.fields.assignee.displayName : null,
+        type: issue.fields.issuetype?.name || 'Unknown',
+        created: issue.fields.created,
+        updated: issue.fields.updated,
+        // ✅ THÊM: Fields mới cho AI context tốt hơn
+        duedate: issue.fields.duedate || null,
+        projectName: issue.fields.project?.name || 'Unknown',
+        projectKey: issue.fields.project?.key || '',
+        resolution: issue.fields.resolution?.name || null,
+        labels: issue.fields.labels || []
       }));
 
       allResults = allResults.concat(batchResults);
 
       // Kiểm tra xem có trang tiếp theo không
       nextPageToken = data.nextPageToken || null;
+      const isLast = data.isLast || false;
 
-      // Nếu không có nextPageToken hoặc đã lấy đủ số lượng yêu cầu thì dừng
-      if (!nextPageToken || data.issues.length < batchSize || allResults.length >= maxResults) {
+      // Dừng nếu: không có nextPageToken, isLast=true, batch nhỏ hơn batchSize, hoặc đạt maxResults
+      if (isLast || !nextPageToken || data.issues.length < batchSize || allResults.length >= maxResults) {
         break;
       }
     }
@@ -922,8 +1375,11 @@ function buildZaloReply(original, jql, results) {
       
       // Count statuses
       const statusCount = {};
+      const projectStats = {}; // ✅ NEW
       list.forEach(item => {
         statusCount[item.status] = (statusCount[item.status] || 0) + 1;
+        const projectName = item.projectName || 'Unknown'; // ✅ NEW
+        projectStats[projectName] = (projectStats[projectName] || 0) + 1; // ✅ NEW
       });
       
       Object.entries(statusCount).forEach(([status, count]) => {
@@ -1826,7 +2282,9 @@ async function callGrok(env, transcript, templateType = 'mom') {
 
 async function askGrok(env, userText) {
   const base = (env.XAI_BASE_URL || 'https://api.x.ai/v1').replace(/\/$/, '');
-  const body = { model: 'grok-3-mini', input: String(userText || ''), temperature: 0.1 };
+  // Sử dụng grok-3-mini-fast để tăng tốc độ response
+  // Temperature 0.2: Cân bằng giữa tốc độ và chất lượng, cao hơn 0.1 để model fast linh hoạt hơn
+  const body = { model: 'grok-3-mini-fast', input: String(userText || ''), temperature: 0.2 };
 
   const r = await fetch(`${base}/responses`, {
     method: 'POST',
@@ -3309,6 +3767,7 @@ function buildConfluenceTableHTML(obj = {}, templateType = 'mom') {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
 ">
   <colgroup>
+    <col style="width:40px">
     <col style="width:65%">
     <col style="width:75px">
     <col style="width:70px">
@@ -3316,6 +3775,18 @@ function buildConfluenceTableHTML(obj = {}, templateType = 'mom') {
   </colgroup>
   <tbody>
     <tr style="background: linear-gradient(135deg, #d63384 0%, #b02a5b 100%);">
+      <th class="confluenceTh" style="
+        padding: 20px 16px;
+        font-weight: 600;
+        font-size: 1.15em;
+        color: #ffffff;
+        text-align: center;
+        border-bottom: 2px solid #8b1538;
+        border-right: 1px solid #c2185b;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        text-shadow: 0 1px 2px rgba(0,0,0,0.2);
+      ">STT</th>
       <th class="confluenceTh" style="
         padding: 20px 16px;
         font-weight: 600;
@@ -3367,6 +3838,16 @@ function buildConfluenceTableHTML(obj = {}, templateType = 'mom') {
         background: ${i % 2 === 0 ? '#ffffff' : '#fffaf8'};
       " onmouseover="this.style.background='#fff8f5'; this.style.transform='scale(1.01)'" 
          onmouseout="this.style.background='${i % 2 === 0 ? '#ffffff' : '#fffaf8'}'; this.style.transform='scale(1)'">
+        <td class="confluenceTd" style="
+          padding: 20px 16px;
+          text-align: center;
+          border-right: 1px solid #fdf2ef;
+          border-bottom: 1px solid #fdf2ef;
+          font-weight: 700;
+          font-size: 1.2em;
+          color: #d63384;
+          background: linear-gradient(135deg, #ffe5f1 0%, #fff0f7 100%);
+        ">${i + 1}</td>
         <td class="confluenceTd" style="
           padding: 20px 16px;
           border-right: 1px solid #fdf2ef;
@@ -7240,7 +7721,7 @@ var emailImgPreview=$('emailImgPreview'), emailStatus=$('emailStatus');
     
     // Get project key from step 1 (space select)
     const spaceSelect = document.getElementById('spaceSelect');
-    const projectKey = spaceSelect ? spaceSelect.value : 'AIG';
+    const projectKey = spaceSelect ? spaceSelect.value.toUpperCase() : 'AIG';
     
     // Populate form
     document.getElementById('jiraSummary').value = summary || 'New Task';
@@ -7937,7 +8418,7 @@ var emailImgPreview=$('emailImgPreview'), emailStatus=$('emailStatus');
     
     // Load components for bulk creation
     const spaceSelect = document.getElementById('spaceSelect');
-    const projectKey = spaceSelect ? spaceSelect.value : 'AIG';
+    const projectKey = spaceSelect ? spaceSelect.value.toUpperCase() : 'AIG';
     try {
       await loadBulkComponentsDropdown(projectKey);
     } catch (error) {
@@ -7963,7 +8444,7 @@ var emailImgPreview=$('emailImgPreview'), emailStatus=$('emailStatus');
     // Load components cho các dropdown sau khi hiển thị popup
     setTimeout(async () => {
       const spaceSelect = document.getElementById('spaceSelect');
-      const projectKey = spaceSelect ? spaceSelect.value : 'AIG';
+      const projectKey = spaceSelect ? spaceSelect.value.toUpperCase() : 'AIG';
       await loadComponentsForAnalysisPopup(projectKey, analysis.tickets);
     }, 100);
   }
@@ -8455,7 +8936,7 @@ var emailImgPreview=$('emailImgPreview'), emailStatus=$('emailStatus');
     }
 
     const spaceSelect = document.getElementById('spaceSelect');
-    const projectKey = spaceSelect ? spaceSelect.value : 'AIG';
+    const projectKey = spaceSelect ? spaceSelect.value.toUpperCase() : 'AIG';
     
     // Sử dụng cấu hình từ ticket đã tạo gần nhất hoặc mặc định
     const defaultParentKey = lastJiraConfig.parentKey || '';
@@ -8659,7 +9140,7 @@ var emailImgPreview=$('emailImgPreview'), emailStatus=$('emailStatus');
           const requestPayload = {
             summary: ticket.summary.trim(),
             description: ticket.note || 'Ticket được tạo từ Action Items',
-            projectKey: spaceSelect ? spaceSelect.value : 'AIG',
+            projectKey: spaceSelect ? spaceSelect.value.toUpperCase() : 'AIG',
             priority: 'Major'
           };
 
@@ -10460,7 +10941,7 @@ const createRes = await fetch('/create-confluence', {
         
         // Get project key from structured space select
         const structuredSpaceSelect = document.getElementById('structuredSpaceSelect');
-        structuredTicketProjectKey = structuredSpaceSelect ? structuredSpaceSelect.value : '';
+        structuredTicketProjectKey = structuredSpaceSelect ? structuredSpaceSelect.value.trim().toUpperCase() : '';
         
         if (!structuredTicketProjectKey) {
           alert('Vui lòng chọn dự án trước khi tạo ticket!');
@@ -10532,7 +11013,7 @@ const createRes = await fetch('/create-confluence', {
     }
 
     const structuredSpaceSelect = document.getElementById('structuredSpaceSelect');
-    const projectKey = structuredSpaceSelect ? structuredSpaceSelect.value.trim() : '';
+    const projectKey = structuredSpaceSelect ? structuredSpaceSelect.value.trim().toUpperCase() : '';
 
     if (!projectKey) {
       alert('Vui lòng chọn dự án trước khi tạo ticket!');
@@ -10723,7 +11204,7 @@ const createRes = await fetch('/create-confluence', {
     }
 
     const structuredSpaceSelect = document.getElementById('structuredSpaceSelect');
-    const projectKey = structuredSpaceSelect ? structuredSpaceSelect.value.trim() : '';
+    const projectKey = structuredSpaceSelect ? structuredSpaceSelect.value.trim().toUpperCase() : '';
 
     if (!projectKey) {
       alert('Vui lòng chọn dự án trước khi tạo ticket!');
@@ -11098,6 +11579,10 @@ function riskRadarHTML() {
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/brands.min.css">
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<!-- Export Libraries -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <style>
 :root{
   --bg:#f0f4f8;
@@ -11237,9 +11722,9 @@ html,body{margin:0;padding:0;background:linear-gradient(135deg, #f0f4f8 0%, #e2e
 }
 .card h3{margin:0 0 10px;font-size:18px;color:#172B4D;display:flex;align-items:center;gap:10px}
 
-/* KPI với hiệu ứng hover nhưng giữ nguyên vị trí số liệu */
+/* KPI COMPACT - Optimized */
 .kpi{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-.kpi .box{background:#F8FFF9;border:1px solid #E6F4EA;border-radius:10px;padding:12px;cursor:pointer;position:relative;overflow:hidden;transition:all 0.3s ease}
+.kpi .box{background:#F8FFF9;border:1px solid #E6F4EA;border-radius:12px;padding:14px;position:relative;overflow:hidden;transition:all 0.3s ease}
 .kpi .box::before {
   content: '';
   position: absolute;
@@ -11256,16 +11741,67 @@ html,body{margin:0;padding:0;background:linear-gradient(135deg, #f0f4f8 0%, #e2e
 .kpi .box:hover {
   background: var(--primary-50);
   border-color: var(--primary);
-  transform: translateY(-4px);
-  box-shadow: var(--shadow-lg);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow);
 }
-.kpi .box > div:first-child {
+
+/* KPI Compact Styles */
+.kpi-compact {
+  cursor: default !important;
+}
+.kpi-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 10px;
+}
+.kpi-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #172B4D;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  line-height: 1.3;
+}
+.kpi-expand-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--primary);
   font-size: 14px;
-  color: var(--muted);
+  padding: 2px 6px;
+  border-radius: 6px;
+  opacity: 0.5;
+  transition: all 0.2s ease;
+}
+.kpi-expand-btn:hover {
+  opacity: 1;
+  background: var(--primary-50);
+  transform: scale(1.1);
+}
+.kpi-value-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   margin-bottom: 8px;
 }
-.kpi .val{font-size:24px;font-weight:800;color:var(--primary);margin-bottom:8px;display:block;text-align:center} /* Thêm display:block và text-align:center để giữ nguyên vị trí */
-.badge{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600}
+.kpi .val{font-size:28px;font-weight:800;color:var(--primary);margin:0;}
+.kpi-desc {
+  font-size: 11px;
+  color: #6B778C;
+  line-height: 1.3;
+  margin-top: 6px;
+}
+.kpi-ticket-list {
+  margin-top: 12px;
+  max-height: 300px;
+  overflow-y: auto;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.badge{display:inline-block;padding:4px 10px;border-radius:999px;font-size:11px;font-weight:600}
 .badge.red{background:#FFEBE6;color:#BF2600}
 .badge.amber{background:#FFFAEB;color:#8F5E00}
 .badge.green{background:#E3FCEF;color:#006644}
@@ -11444,15 +11980,79 @@ html,body{margin:0;padding:0;background:linear-gradient(135deg, #f0f4f8 0%, #e2e
 .select{width:100%;padding:14px 18px;border:1px solid var(--line);border-radius:16px;background:var(--card);font-size:15px;transition:all 0.3s ease}
 .select:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 4px rgba(0, 150, 57, 0.1)}
 
+/* Time Range Quick Select Buttons */
+.time-range-btn{
+  padding:8px 16px;
+  border:1px solid var(--line);
+  border-radius:10px;
+  background:var(--card);
+  color:var(--text);
+  font-size:13px;
+  font-weight:600;
+  cursor:pointer;
+  transition:all 0.3s ease;
+  white-space:nowrap;
+}
+.time-range-btn:hover{
+  background:var(--primary-50);
+  border-color:var(--primary);
+  color:var(--primary);
+  transform:translateY(-2px);
+  box-shadow:var(--shadow);
+}
+.time-range-btn.active{
+  background:var(--primary);
+  color:white;
+  border-color:var(--primary);
+  box-shadow:0 4px 12px rgba(0, 150, 57, 0.3);
+}
+.time-range-btn i{
+  font-size:12px;
+  margin-right:4px;
+}
+
 /* Buttons với hiệu ứng hover */
 .detail-btn{transition:all 0.2s ease}
 .detail-btn:hover{background:var(--primary-600) !important;transform:translateY(-1px)}
 .analyze-btn{transition:all 0.2s ease;background:var(--primary) !important}
 .analyze-btn:hover{background:var(--primary-600) !important;transform:translateY(-1px)}
 .analyze-btn:disabled{background:#9ca3af !important;cursor:not-allowed}
-.generate-risk-btn{padding:10px 20px;background:var(--primary);color:white;border:none;border-radius:8px;font-weight:600;cursor:pointer;margin-bottom:16px;display:flex;align-items:center;gap:8px;transition:all 0.3s ease}
+.generate-risk-btn{padding:10px 20px;background:var(--primary);color:white;border:none;border-radius:8px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:8px;transition:all 0.3s ease}
 .generate-risk-btn:hover{background:var(--primary-600);transform:translateY(-2px);box-shadow:var(--shadow-lg)}
 .generate-risk-btn:disabled{background:#9ca3af;cursor:not-allowed}
+
+/* Export Buttons */
+.export-btn {
+  padding: 10px 20px;
+  border: none;
+  border-radius: 8px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: all 0.3s ease;
+  font-size: 14px;
+}
+
+.export-btn:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-lg);
+}
+
+.export-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.export-pdf-btn {
+  background: #dc2626;
+  color: white;
+}
+
+.export-pdf-btn:hover:not(:disabled) {
+  background: #b91c1c;
+}
 
 /* Dashboard Action Buttons - Unified Design */
 .dashboard-actions {
@@ -11632,10 +12232,29 @@ canvas{display:block;width:100%;height:280px;max-height:280px}
     display: none;
   }
   .kpi {
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: 1fr;
   }
   .grid {
     grid-template-columns: 1fr;
+  }
+  
+  /* Time Range Buttons - Stack on mobile */
+  .time-range-btn {
+    font-size: 12px;
+    padding: 6px 12px;
+  }
+}
+
+@media (max-width: 768px) {
+  /* Project selection - Stack vertically */
+  .card > div[style*="grid-template-columns"] {
+    grid-template-columns: 1fr !important;
+  }
+  
+  /* Time range buttons wrap */
+  div[style*="display: flex"] .time-range-btn {
+    flex: 1;
+    min-width: fit-content;
   }
 }
 </style>
@@ -11675,18 +12294,55 @@ canvas{display:block;width:100%;height:280px;max-height:280px}
   </header>
 
   <main class="container">
-    <!-- Project Selection -->
+    <!-- Project Selection with Date Range - OPTIMIZED -->
     <div class="card" style="margin-bottom: 20px;">
-      <h3><i class="fas fa-project-diagram"></i> Chọn dự án</h3>
-      <div style="display: grid; grid-template-columns: 1fr auto; gap: 16px; align-items: end;">
+      <h3><i class="fas fa-project-diagram"></i> Chọn dự án và khoảng thời gian</h3>
+      
+      <div style="display: grid; grid-template-columns: 2fr 3fr auto; gap: 20px; align-items: end;">
+        <!-- Project Select -->
         <div>
-          <label style="display: block; margin-bottom: 8px; font-weight: 600; color: #172B4D;">Dự án:</label>
+          <label style="display: block; margin-bottom: 8px; font-weight: 600; color: #172B4D;">
+            <i class="fas fa-folder"></i> Dự án:
+          </label>
           <select id="projectSelect" class="select">
             <option value="">-- Đang tải danh sách dự án --</option>
           </select>
         </div>
+        
+        <!-- Time Range Quick Select + Custom -->
         <div>
-          <button id="loadDataBtn" class="generate-risk-btn">
+          <label style="display: block; margin-bottom: 8px; font-weight: 600; color: #172B4D;">
+            <i class="fas fa-calendar-alt"></i> Khoảng thời gian:
+          </label>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <!-- Quick Select Buttons -->
+            <button class="time-range-btn" data-range="7d">7 ngày</button>
+            <button class="time-range-btn" data-range="30d">30 ngày</button>
+            <button class="time-range-btn active" data-range="3m">3 tháng</button>
+            <button class="time-range-btn" data-range="6m">6 tháng</button>
+            <button class="time-range-btn" data-range="custom" id="customRangeBtn">
+              <i class="fas fa-calendar-week"></i> Tùy chỉnh
+            </button>
+          </div>
+          
+          <!-- Custom Date Range (Hidden by default) -->
+          <div id="customDateRange" style="display: none; margin-top: 12px; padding: 12px; background: #f8fafc; border-radius: 8px; border: 1px solid var(--line);">
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+              <div>
+                <label style="display: block; margin-bottom: 6px; font-size: 12px; font-weight: 600; color: #6B778C;">Từ ngày:</label>
+                <input type="date" id="startDate" class="select" style="padding: 10px 14px; font-size: 14px;">
+              </div>
+              <div>
+                <label style="display: block; margin-bottom: 6px; font-size: 12px; font-weight: 600; color: #6B778C;">Đến ngày:</label>
+                <input type="date" id="endDate" class="select" style="padding: 10px 14px; font-size: 14px;">
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        <!-- Load Button -->
+        <div>
+          <button id="loadDataBtn" class="generate-risk-btn" style="min-width: 140px;">
             <i class="fas fa-sync-alt"></i>
             <span>Tải dữ liệu</span>
           </button>
@@ -11694,27 +12350,60 @@ canvas{display:block;width:100%;height:280px;max-height:280px}
       </div>
     </div>
 
-    <!-- KPI -->
-    <div class="kpi">
-      <div class="box clickable-kpi" data-jql="project = PROJECT_KEY AND duedate < now() AND status != Done" data-title="Ticket quá hạn">
-        <div>Trễ hạn sprint</div>
-        <div class="val">0</div>
-        <span class="badge green">Thấp</span>
+    <!-- KPI COMPACT - Optimized -->
+    <div class="kpi" style="grid-template-columns: repeat(3, 1fr); gap: 12px;">
+      <div class="box kpi-compact">
+        <div class="kpi-header">
+          <div class="kpi-title">
+            <i class="fas fa-clock" style="color: #f59e0b; font-size: 14px;"></i>
+            Ticket trễ hạn sprint
+          </div>
+          <button class="kpi-expand-btn" data-kpi="sprintDelay">
+            <i class="fas fa-chevron-down"></i>
+          </button>
+        </div>
+        <div class="kpi-value-row">
+          <div class="val" id="sprintDelayVal">0</div>
+          <span class="badge green" id="sprintDelayBadge">Thấp</span>
+        </div>
+        <div class="kpi-desc">Loại trừ Done/Closed, sprint đã qua</div>
+        <div class="kpi-ticket-list" id="sprintDelayList" style="display: none;">
+          <div style="font-size: 12px; color: #6B778C;">Đang tải...</div>
+        </div>
       </div>
-      <div class="box clickable-kpi" data-jql="project = PROJECT_KEY AND duedate < now() AND status != Done" data-title="Ticket quá hạn">
-        <div>Ticket quá hạn</div>
-        <div class="val">0</div>
-        <span class="badge green">Thấp</span>
+      
+      <div class="box kpi-compact">
+        <div class="kpi-header">
+          <div class="kpi-title">
+            <i class="fas fa-exclamation-triangle" style="color: #dc2626; font-size: 14px;"></i>
+            Ticket quá hạn
+          </div>
+          <button class="kpi-expand-btn" data-kpi="overdue">
+            <i class="fas fa-chevron-down"></i>
+          </button>
+        </div>
+        <div class="kpi-value-row">
+          <div class="val" id="overdueVal">0</div>
+          <span class="badge green" id="overdueBadge">Thấp</span>
+        </div>
+        <div class="kpi-desc">Loại trừ Done/Closed, tính số ngày trễ</div>
+        <div class="kpi-ticket-list" id="overdueList" style="display: none;">
+          <div style="font-size: 12px; color: #6B778C;">Đang tải...</div>
+        </div>
       </div>
-      <div class="box clickable-kpi" data-jql="project = PROJECT_KEY AND created >= -7d" data-title="Ticket mới trong tuần">
-        <div>Backlog tăng bất thường</div>
-        <div class="val">0%</div>
-        <span class="badge green">Bình thường</span>
-      </div>
-      <div class="box clickable-kpi" data-jql="project = PROJECT_KEY AND priority in (Highest, High)" data-title="Ticket priority cao">
-        <div>Dự báo rủi ro (H/M/L)</div>
-        <div class="val">0 / 0 / 0</div>
-        <span class="badge green">Theo 4 tuần</span>
+      
+      <div class="box kpi-compact clickable-kpi" data-jql="project = PROJECT_KEY AND created >= -7d" data-title="Backlog tăng bất thường">
+        <div class="kpi-header">
+          <div class="kpi-title">
+            <i class="fas fa-chart-line" style="color: #3b82f6; font-size: 14px;"></i>
+            Backlog tăng bất thường
+          </div>
+        </div>
+        <div class="kpi-value-row">
+          <div class="val" id="backlogVal">0%</div>
+          <span class="badge green" id="backlogBadge">Bình thường</span>
+        </div>
+        <div class="kpi-desc">So với tuần trước</div>
       </div>
     </div>
 
@@ -11751,7 +12440,7 @@ canvas{display:block;width:100%;height:280px;max-height:280px}
           
           <canvas id="overdueChart" style="height: 280px; max-height: 280px;"></canvas>
           <div class="jql-inline"><span class="jql-label">JQL:</span> <code id="dash1JqlText">project = PROJECT_KEY AND duedate < now() AND status != Done</code> <button class="jql-copy-inline" data-target="dash1JqlText">Sao chép</button></div>
-          <div class="note" style="font-size: 12px;">Theo dõi tickets quá deadline</div>
+          <div class="note" style="font-size: 12px;">📊 <strong>Giải thích:</strong> Biểu đồ hiển thị số lượng tickets quá hạn theo tuần, giúp phát hiện xu hướng trễ deadline để kịp thời điều chỉnh</div>
         </div>
         
         <!-- Bảng rủi ro AI cho Dashboard 1 -->
@@ -11798,7 +12487,7 @@ canvas{display:block;width:100%;height:280px;max-height:280px}
           
           <canvas id="issueTypeChart" style="height: 280px; max-height: 280px;"></canvas>
           <div class="jql-inline"><span class="jql-label">JQL:</span> <code id="dash2JqlText">project = PROJECT_KEY</code> <button class="jql-copy-inline" data-target="dash2JqlText">Sao chép</button></div>
-          <div class="note" style="font-size: 12px;">Story/Task/Bug/Epic/Subtask</div>
+          <div class="note" style="font-size: 12px;">📊 <strong>Giải thích:</strong> Phân bổ công việc theo loại (Story/Task/Bug/Epic). Nếu Bug >20% thì chất lượng code cần cải thiện</div>
         </div>
         
         <!-- Bảng rủi ro AI cho Dashboard 2 -->
@@ -11845,7 +12534,7 @@ canvas{display:block;width:100%;height:280px;max-height:280px}
           
           <canvas id="effortChart" style="height: 280px; max-height: 280px;"></canvas>
           <div class="jql-inline"><span class="jql-label">JQL:</span> <code id="dash3JqlText">project = PROJECT_KEY</code> <button class="jql-copy-inline" data-target="dash3JqlText">Sao chép</button></div>
-          <div class="note" style="font-size: 12px;">Phát hiện quá tải nhân sự</div>
+          <div class="note" style="font-size: 12px;">📊 <strong>Giải thích:</strong> Phân bổ workload theo nhân sự. Nếu ai >10 tickets thì cần redistribute để tránh quá tải và burnout</div>
         </div>
         
         <!-- Bảng rủi ro AI cho Dashboard 3 -->
@@ -11867,16 +12556,23 @@ canvas{display:block;width:100%;height:280px;max-height:280px}
     <div class="risk-analysis-section">
       <h3 class="risk-analysis-title">
         <i class="fas fa-shield-exclamation"></i>
-        AI Risk Analysis - Comprehensive Assessment
+        AI Risk Analysis - Bảng tổng hợp
         <button id="riskInfoBtn" class="info-btn" title="Xem hướng dẫn đánh giá điểm & mức độ rủi ro">
           <i class="fas fa-question-circle"></i>
         </button>
       </h3>
       
-      <button id="generateRiskBtn" class="generate-risk-btn">
-        <i class="fas fa-brain"></i>
-        <span>Generate Risk Analysis</span>
-      </button>
+      <div style="display: flex; gap: 12px; align-items: center; margin-bottom: 16px;">
+        <button id="generateRiskBtn" class="generate-risk-btn">
+          <i class="fas fa-brain"></i>
+          <span>Generate Risk Analysis</span>
+        </button>
+        
+        <button id="exportPdfBtn" class="export-btn export-pdf-btn" style="display:none;" title="Export báo cáo dạng PDF">
+          <i class="fas fa-file-pdf"></i>
+          <span>Export PDF</span>
+        </button>
+      </div>
       
       <!-- Risk Scoring Guide Panel (Initially Hidden) -->
       <div id="riskScoringGuide" class="risk-guide-panel" style="display:none;">
@@ -11987,19 +12683,18 @@ canvas{display:block;width:100%;height:280px;max-height:280px}
         <table class="risk-table">
           <thead>
             <tr>
-              <th style="width:7%">Điểm</th>
-              <th style="width:9%">Mức độ</th>
-              <th style="width:20%">Giải thích</th>
-              <th style="width:10%">Chi tiết</th>
-              <th style="width:24%">Mô tả</th>
-              <th style="width:20%">Hành động cụ thể</th>
-              <th style="width:8%">PIC</th>
+              <th style="width:6%">Điểm</th>
+              <th style="width:8%">Mức độ</th>
+              <th style="width:20%">Giải thích (Tại sao?)</th>
+              <th style="width:22%">Căn cứ & Công thức</th>
+              <th style="width:20%">Mô tả rủi ro</th>
+              <th style="width:22%">Hành động khuyến nghị</th>
               <th style="width:2%">Action</th>
             </tr>
           </thead>
           <tbody id="riskAnalysisTableBody">
             <tr>
-              <td colspan="8" style="text-align:center;color:#6B778C;padding:20px;">
+              <td colspan="7" style="text-align:center;color:#6B778C;padding:20px;">
                 Chưa có phân tích rủi ro. Bấm "Generate Risk Analysis" để bắt đầu.
               </td>
             </tr>
@@ -12065,12 +12760,17 @@ canvas{display:block;width:100%;height:280px;max-height:280px}
               <div id="confirmProjectKey" style="color: #172B4D; font-size: 14px;"></div>
             </div>
             <div>
+              <div style="font-weight: 600; color: #6B778C; font-size: 13px; margin-bottom: 4px;">Parent Key (Epic/Story - tùy chọn):</div>
+              <input type="text" id="confirmParentKey" placeholder="Ví dụ: PROJ-123" style="width: 100%; padding: 8px 12px; border: 1px solid #e2e8f0; border-radius: 4px; font-size: 14px; color: #172B4D;" />
+              <div style="font-size: 12px; color: #6B778C; margin-top: 4px;">💡 Để trống nếu không cần gắn vào Epic/Story nào</div>
+            </div>
+            <div>
               <div style="font-weight: 600; color: #6B778C; font-size: 13px; margin-bottom: 4px;">Summary (Mô tả rủi ro):</div>
-              <div id="confirmSummary" style="color: #172B4D; font-size: 14px; background: white; padding: 8px; border-radius: 4px; border: 1px solid #e2e8f0;"></div>
+              <textarea id="confirmSummary" style="width: 100%; padding: 8px; border-radius: 4px; border: 1px solid #e2e8f0; font-size: 14px; color: #172B4D; min-height: 60px; font-family: inherit; resize: vertical;"></textarea>
             </div>
             <div>
               <div style="font-weight: 600; color: #6B778C; font-size: 13px; margin-bottom: 4px;">Description (Hành động khuyến nghị):</div>
-              <div id="confirmDescription" style="color: #172B4D; font-size: 14px; background: white; padding: 8px; border-radius: 4px; border: 1px solid #e2e8f0;"></div>
+              <textarea id="confirmDescription" style="width: 100%; padding: 8px; border-radius: 4px; border: 1px solid #e2e8f0; font-size: 14px; color: #172B4D; min-height: 80px; font-family: inherit; resize: vertical;"></textarea>
             </div>
           </div>
         </div>
@@ -12096,6 +12796,111 @@ canvas{display:block;width:100%;height:280px;max-height:280px}
     </div>
   </div>
 
+  <!-- Hidden PDF Template for Export (html2canvas) - MULTI-PAGE SUPPORT -->
+  <div id="pdfTemplate" style="position: fixed; left: -9999px; top: -9999px; width: 1123px; background: white; font-family: 'Segoe UI', Roboto, 'Noto Sans', system-ui, -apple-system, sans-serif;">
+    <!-- Container with flexible height for multi-page content -->
+    <div style="width: 1123px; padding: 22px 32px; box-sizing: border-box; background: #ffffff;">
+      
+      <!-- Header - Compact & Professional -->
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%); padding: 14px 18px; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); border-left: 4px solid #009639;">
+        <div style="display: flex; align-items: center; gap: 14px;">
+          <div style="width: 48px; height: 48px; background: linear-gradient(135deg, #009639 0%, #00b347 100%); border-radius: 10px; display: flex; align-items: center; justify-content: center; box-shadow: 0 3px 8px rgba(0,150,57,0.2);">
+            <span style="color: white; font-size: 20px; font-weight: 900; letter-spacing: -0.5px;">PMO</span>
+          </div>
+          <div>
+            <h1 style="margin: 0; font-size: 24px; color: #0f172a; font-weight: 800; letter-spacing: -0.8px; line-height: 1.1;">BÁO CÁO PHÂN TÍCH RỦI RO DỰ ÁN</h1>
+            <p style="margin: 4px 0 0 0; font-size: 12px; color: #64748b; font-weight: 600; letter-spacing: 0.2px;">AI Risk Analysis - Comprehensive Assessment</p>
+          </div>
+        </div>
+        <div style="text-align: right; font-size: 13px; color: #334155; font-weight: 600; line-height: 1.6;">
+          <div style="margin-bottom: 1px;"><span style="color: #64748b;">Dự án:</span> <span id="pdf-project-name" style="color: #009639; font-weight: 700;">---</span></div>
+          <div style="margin-bottom: 1px;"><span style="color: #64748b;">Ngày:</span> <span id="pdf-date" style="font-weight: 700;">---</span></div>
+          <div><span style="color: #64748b;">Tổng rủi ro:</span> <span id="pdf-total-risks" style="color: #dc2626; font-weight: 700;">---</span></div>
+        </div>
+      </div>
+
+      <!-- Summary Statistics - Compact Design -->
+      <div style="display: flex; gap: 10px; margin-bottom: 16px;">
+        <div style="flex: 1; text-align: center; padding: 11px 10px; background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%); border-radius: 10px; border: 2px solid #fca5a5; box-shadow: 0 1px 4px rgba(220,38,38,0.12);">
+          <div style="font-size: 26px; font-weight: 900; color: #dc2626; line-height: 1;" id="pdf-extreme-count">0</div>
+          <div style="font-size: 10px; color: #991b1b; font-weight: 700; margin-top: 4px; letter-spacing: 0.7px;">EXTREME</div>
+        </div>
+        <div style="flex: 1; text-align: center; padding: 11px 10px; background: linear-gradient(135deg, #fff1f2 0%, #ffe4e6 100%); border-radius: 10px; border: 2px solid #fda4af; box-shadow: 0 1px 4px rgba(239,68,68,0.12);">
+          <div style="font-size: 26px; font-weight: 900; color: #ef4444; line-height: 1;" id="pdf-high-count">0</div>
+          <div style="font-size: 10px; color: #b91c1c; font-weight: 700; margin-top: 4px; letter-spacing: 0.7px;">HIGH</div>
+        </div>
+        <div style="flex: 1; text-align: center; padding: 11px 10px; background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%); border-radius: 10px; border: 2px solid #fcd34d; box-shadow: 0 1px 4px rgba(245,158,11,0.12);">
+          <div style="font-size: 26px; font-weight: 900; color: #f59e0b; line-height: 1;" id="pdf-medium-count">0</div>
+          <div style="font-size: 10px; color: #92400e; font-weight: 700; margin-top: 4px; letter-spacing: 0.7px;">MEDIUM</div>
+        </div>
+        <div style="flex: 1; text-align: center; padding: 11px 10px; background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%); border-radius: 10px; border: 2px solid #86efac; box-shadow: 0 1px 4px rgba(34,197,94,0.12);">
+          <div style="font-size: 26px; font-weight: 900; color: #22c55e; line-height: 1;" id="pdf-low-count">0</div>
+          <div style="font-size: 10px; color: #166534; font-weight: 700; margin-top: 4px; letter-spacing: 0.7px;">LOW</div>
+        </div>
+      </div>
+
+      <!-- 3 Main Sections: Nhân sự, Tiến độ, Chất lượng - 3 COLUMNS for landscape -->
+      <div id="pdf-sections-container" style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; margin-bottom: 16px;">
+        
+        <!-- Section 1: Nhân sự -->
+        <div class="pdf-section" data-category="nhansu">
+          <div style="background: linear-gradient(135deg, #3b82f6 0%, #60a5fa 100%); padding: 10px 14px; border-radius: 8px 8px 0 0; display: flex; align-items: center; gap: 8px; box-shadow: 0 1px 4px rgba(59,130,246,0.2);">
+            <span style="font-size: 18px;">👥</span>
+            <h2 style="margin: 0; font-size: 15px; color: white; font-weight: 800; letter-spacing: 0.4px;">NHÂN SỰ</h2>
+          </div>
+          <div style="background: #ffffff; padding: 10px; border-radius: 0 0 8px 8px; border: 2px solid #3b82f6; border-top: none; box-shadow: 0 1px 4px rgba(0,0,0,0.04);">
+            <div style="background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; border-left: 3px solid #3b82f6;">
+              <div style="font-size: 11px; font-weight: 700; color: #1e40af;" class="section-count">0 rủi ro</div>
+            </div>
+            <div class="pdf-risks-container">
+              <div style="font-size: 11px; color: #94a3b8; text-align: center; padding: 16px; font-weight: 600;">Không có rủi ro về nhân sự</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Section 2: Tiến độ -->
+        <div class="pdf-section" data-category="tiendo">
+          <div style="background: linear-gradient(135deg, #f59e0b 0%, #fbbf24 100%); padding: 10px 14px; border-radius: 8px 8px 0 0; display: flex; align-items: center; gap: 8px; box-shadow: 0 1px 4px rgba(245,158,11,0.2);">
+            <span style="font-size: 18px;">⏰</span>
+            <h2 style="margin: 0; font-size: 15px; color: white; font-weight: 800; letter-spacing: 0.4px;">TIẾN ĐỘ</h2>
+          </div>
+          <div style="background: #ffffff; padding: 10px; border-radius: 0 0 8px 8px; border: 2px solid #f59e0b; border-top: none; box-shadow: 0 1px 4px rgba(0,0,0,0.04);">
+            <div style="background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%); border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; border-left: 3px solid #f59e0b;">
+              <div style="font-size: 11px; font-weight: 700; color: #92400e;" class="section-count">0 rủi ro</div>
+            </div>
+            <div class="pdf-risks-container">
+              <div style="font-size: 11px; color: #94a3b8; text-align: center; padding: 16px; font-weight: 600;">Không có rủi ro về tiến độ</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Section 3: Chất lượng -->
+        <div class="pdf-section" data-category="chatluong">
+          <div style="background: linear-gradient(135deg, #ef4444 0%, #f87171 100%); padding: 10px 14px; border-radius: 8px 8px 0 0; display: flex; align-items: center; gap: 8px; box-shadow: 0 1px 4px rgba(239,68,68,0.2);">
+            <span style="font-size: 18px;">🐛</span>
+            <h2 style="margin: 0; font-size: 15px; color: white; font-weight: 800; letter-spacing: 0.4px;">CHẤT LƯỢNG</h2>
+          </div>
+          <div style="background: #ffffff; padding: 10px; border-radius: 0 0 8px 8px; border: 2px solid #ef4444; border-top: none; box-shadow: 0 1px 4px rgba(0,0,0,0.04);">
+            <div style="background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%); border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; border-left: 3px solid #ef4444;">
+              <div style="font-size: 11px; font-weight: 700; color: #991b1b;" class="section-count">0 rủi ro</div>
+            </div>
+            <div class="pdf-risks-container">
+              <div style="font-size: 11px; color: #94a3b8; text-align: center; padding: 16px; font-weight: 600;">Không có rủi ro về chất lượng</div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Footer -->
+      <div style="padding: 12px 16px; background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%); border-radius: 8px; text-align: center; font-size: 10px; color: #64748b; font-weight: 600; box-shadow: 0 1px 3px rgba(0,0,0,0.04);">
+        <div style="font-weight: 800; color: #009639; margin-bottom: 3px; font-size: 11px; letter-spacing: 0.3px;">BIDV PMO - AI Risk Management System</div>
+        <div style="font-size: 9px; color: #94a3b8;">Confidential - For Internal Use Only</div>
+      </div>
+
+    </div>
+  </div>
+
 <script>
 document.addEventListener("DOMContentLoaded", function(){
 // ====== GLOBAL VARIABLES ======
@@ -12105,6 +12910,20 @@ document.addEventListener("DOMContentLoaded", function(){
   
   const projectSelect = document.getElementById('projectSelect');
   const loadDataBtn = document.getElementById('loadDataBtn');
+  const startDateInput = document.getElementById('startDate');
+  const endDateInput = document.getElementById('endDate');
+  
+  // Set default date range (3 months back to today)
+  const today = new Date();
+  const threeMonthsAgo = new Date();
+  threeMonthsAgo.setMonth(today.getMonth() - 3);
+  
+  if (startDateInput) {
+    startDateInput.value = threeMonthsAgo.toISOString().split('T')[0];
+  }
+  if (endDateInput) {
+    endDateInput.value = today.toISOString().split('T')[0];
+  }
   
   // ====== CHART DATA (sẽ được cập nhật từ Jira) ======
   let chartData = {
@@ -12225,12 +13044,24 @@ document.addEventListener("DOMContentLoaded", function(){
       
       console.log('Loading issues for project:', currentProjectKey);
       
+      const requestBody = {
+        projectKey: currentProjectKey
+      };
+      
+      // Add date range if specified
+      if (startDateInput && startDateInput.value) {
+        requestBody.startDate = startDateInput.value;
+      }
+      if (endDateInput && endDateInput.value) {
+        requestBody.endDate = endDateInput.value;
+      }
+      
+      console.log('Request body:', requestBody);
+      
       const response = await fetch('/api/jira-issues', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          projectKey: currentProjectKey
-        })
+        body: JSON.stringify(requestBody)
       });
       
       console.log('Response status:', response.status);
@@ -12242,21 +13073,34 @@ document.addEventListener("DOMContentLoaded", function(){
       }
       
       const responseData = await response.json();
-      console.log('Response data:', responseData);
+      console.log('Response data summary:', {
+        ok: responseData.ok,
+        issuesCount: responseData.issues?.length,
+        total: responseData.total
+      });
       
       if (!responseData.ok) {
         throw new Error(responseData.error || 'API returned error');
       }
       
       jiraData = responseData;
+      
+      // Hiển thị số lượng issues đã load
+      const issueCount = jiraData.issues?.length || 0;
+      loadDataBtn.innerHTML = '<i class="fas fa-check"></i><span>Đã tải ' + issueCount.toLocaleString() + ' tickets</span>';
+      
       updateChartsWithJiraData();
+      
+      // Reset lại button sau 2s
+      setTimeout(() => {
+        loadDataBtn.innerHTML = '<i class="fas fa-sync-alt"></i><span>Tải dữ liệu</span>';
+      }, 2000);
       
     } catch (error) {
       console.error('Error loading issues:', error);
       alert('Lỗi tải dữ liệu: ' + error.message);
     } finally {
       loadDataBtn.disabled = false;
-      loadDataBtn.innerHTML = '<i class="fas fa-sync-alt"></i><span>Tải dữ liệu</span>';
     }
   }
   
@@ -12300,32 +13144,133 @@ document.addEventListener("DOMContentLoaded", function(){
   }
   
   function updateJQLDisplayText() {
-    // Cập nhật JQL text cho 3 dashboard với projectKey thực tế
+    // Cập nhật JQL text cho 3 dashboard với projectKey thực tế và date range
     const dash1JqlText = document.getElementById('dash1JqlText');
     const dash2JqlText = document.getElementById('dash2JqlText');
     const dash3JqlText = document.getElementById('dash3JqlText');
     
+    // Get date range from inputs
+    let dateFilter = '';
+    if (startDateInput && startDateInput.value && endDateInput && endDateInput.value) {
+      const startDate = startDateInput.value;
+      const endDate = endDateInput.value;
+      dateFilter = ' AND created >= "' + startDate + '" AND created <= "' + endDate + '"';
+    }
+    
     if (dash1JqlText && currentProjectKey) {
-      dash1JqlText.textContent = 'project = ' + currentProjectKey + ' AND duedate < now() AND status != Done';
+      dash1JqlText.textContent = 'project = ' + currentProjectKey + dateFilter + ' AND duedate < now() AND status != Done';
     }
     
     if (dash2JqlText && currentProjectKey) {
-      dash2JqlText.textContent = 'project = ' + currentProjectKey;
+      dash2JqlText.textContent = 'project = ' + currentProjectKey + dateFilter;
     }
     
     if (dash3JqlText && currentProjectKey) {
-      dash3JqlText.textContent = 'project = ' + currentProjectKey;
+      dash3JqlText.textContent = 'project = ' + currentProjectKey + dateFilter;
     }
   }
   
   function updateKPI() {
-    // Cập nhật các KPI dựa trên dữ liệu Jira
-    const kpiBoxes = document.querySelectorAll('.kpi .box');
-    if (kpiBoxes.length >= 4) {
-      kpiBoxes[0].querySelector('.val').textContent = jiraData.sprintDelayCount || 0;
-      kpiBoxes[1].querySelector('.val').textContent = jiraData.overdueCount || 0;
-      kpiBoxes[2].querySelector('.val').textContent = jiraData.backlogGrowth || '0%';
-      kpiBoxes[3].querySelector('.val').textContent = (jiraData.highRisk || 0) + ' / ' + (jiraData.mediumRisk || 0) + ' / ' + (jiraData.lowRisk || 0);
+    if (!jiraData || !jiraData.issues) return;
+    
+    const now = new Date();
+    const excludeStatuses = ['Done', 'Closed'];
+    
+    // Calculate Sprint Delay tickets (exclude Done/Closed, có sprint deadline đã qua)
+    const sprintDelayTickets = jiraData.issues.filter(issue => {
+      const status = issue.fields.status?.name;
+      if (excludeStatuses.includes(status)) return false;
+      
+      // Check if has sprint field and sprint end date
+      const sprint = issue.fields.sprint;
+      if (!sprint || !sprint.endDate) return false;
+      
+      const sprintEndDate = new Date(sprint.endDate);
+      return sprintEndDate < now;
+    });
+    
+    // Calculate Overdue tickets (exclude Done/Closed, đã quá deadline)
+    const overdueTickets = jiraData.issues.filter(issue => {
+      const status = issue.fields.status?.name;
+      if (excludeStatuses.includes(status)) return false;
+      
+      const duedate = issue.fields.duedate;
+      if (!duedate) return false;
+      
+      return new Date(duedate) < now;
+    });
+    
+    // Calculate Backlog Growth
+    const oneWeekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const twoWeeksAgo = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+    
+    const thisWeekCreated = jiraData.issues.filter(issue => {
+      const created = new Date(issue.fields.created);
+      return created >= oneWeekAgo;
+    }).length;
+    
+    const lastWeekCreated = jiraData.issues.filter(issue => {
+      const created = new Date(issue.fields.created);
+      return created >= twoWeeksAgo && created < oneWeekAgo;
+    }).length;
+    
+    const backlogGrowth = lastWeekCreated > 0 
+      ? Math.round(((thisWeekCreated - lastWeekCreated) / lastWeekCreated) * 100) 
+      : (thisWeekCreated > 0 ? 100 : 0);
+    
+    // Update KPI values
+    const sprintDelayVal = document.getElementById('sprintDelayVal');
+    const overdueVal = document.getElementById('overdueVal');
+    const backlogVal = document.getElementById('backlogVal');
+    
+    if (sprintDelayVal) sprintDelayVal.textContent = sprintDelayTickets.length;
+    if (overdueVal) overdueVal.textContent = overdueTickets.length;
+    if (backlogVal) backlogVal.textContent = backlogGrowth + '%';
+    
+    // Update badges
+    updateKPIBadge('sprintDelayBadge', sprintDelayTickets.length, jiraData.issues.length);
+    updateKPIBadge('overdueBadge', overdueTickets.length, jiraData.issues.length);
+    updateBacklogBadge('backlogBadge', backlogGrowth);
+    
+    // Store ticket lists for expansion
+    window.sprintDelayTickets = sprintDelayTickets;
+    window.overdueTickets = overdueTickets;
+  }
+  
+  function updateKPIBadge(badgeId, count, total) {
+    const badge = document.getElementById(badgeId);
+    if (!badge) return;
+    
+    const percentage = total > 0 ? (count / total) * 100 : 0;
+    
+    if (percentage > 15) {
+      badge.className = 'badge red';
+      badge.textContent = 'Cao';
+    } else if (percentage > 5) {
+      badge.className = 'badge amber';
+      badge.textContent = 'Trung bình';
+    } else {
+      badge.className = 'badge green';
+      badge.textContent = 'Thấp';
+    }
+  }
+  
+  function updateBacklogBadge(badgeId, growth) {
+    const badge = document.getElementById(badgeId);
+    if (!badge) return;
+    
+    if (growth > 50) {
+      badge.className = 'badge red';
+      badge.textContent = 'Tăng cao';
+    } else if (growth > 20) {
+      badge.className = 'badge amber';
+      badge.textContent = 'Tăng vừa';
+    } else if (growth < -20) {
+      badge.className = 'badge green';
+      badge.textContent = 'Giảm tốt';
+    } else {
+      badge.className = 'badge green';
+      badge.textContent = 'Bình thường';
     }
   }
   
@@ -12881,6 +13826,10 @@ function showEffortDetails() {
       currentRisks = result.risks; // Lưu data để edit sau
       displayComprehensiveRiskAnalysis(result.risks);
       
+      // Show export PDF button only
+      const exportPdfBtn = document.getElementById('exportPdfBtn');
+      if (exportPdfBtn) exportPdfBtn.style.display = 'flex';
+      
     } catch (error) {
       console.error('Risk Analysis error:', error);
       tableBody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#dc2626;padding:20px;">Lỗi phân tích rủi ro: ' + error.message + '</td></tr>';
@@ -12949,7 +13898,7 @@ function showEffortDetails() {
   function displayComprehensiveRiskAnalysis(risks) {
     if (!risks || !Array.isArray(risks)) {
       document.getElementById('riskAnalysisTableBody').innerHTML = 
-        '<tr><td colspan="8" style="text-align:center;color:#6B778C;padding:20px;">Không có kết quả phân tích</td></tr>';
+        '<tr><td colspan="7" style="text-align:center;color:#6B778C;padding:20px;">Không có kết quả phân tích</td></tr>';
       return;
     }
     
@@ -12959,20 +13908,19 @@ function showEffortDetails() {
       const levelClass = getRiskLevelClass(risk.level);
       const statusClass = getRiskStatusClass(risk.status);
       
-      // Generate detailed explanation if not provided by backend
-      let explanation = risk.explanation;
-      if (!explanation || explanation === 'Điểm và mức độ dựa trên phân tích AI tổng hợp từ dữ liệu dự án') {
-        explanation = generateDetailedExplanation(risk);
-      }
+      // Generate simplified explanation (just the problem, not actions or data sources)
+      let explanation = generateSimplifiedExplanation(risk);
+      
+      // Generate detailed info (actions + data sources moved here)
+      let detailInfo = generateDetailedInfo(risk);
       
       return '<tr>' +
         '<td class="risk-score ' + scoreClass + '">' + risk.score + '</td>' +
         '<td class="' + levelClass + '">' + risk.level + '</td>' +
-        '<td class="editable-cell" data-field="explanation" data-index="' + index + '" style="font-size:12px;color:#6B778C;">' + 
+        '<td style="font-size:12px;">' + 
           explanation + 
-          '<div class="edit-hint">Nhấp đúp để chỉnh sửa</div>' +
         '</td>' +
-        '<td><span class="risk-status ' + statusClass + '">' + risk.status + '</span></td>' +
+        '<td style="font-size:11px;">' + detailInfo + '</td>' +
         '<td class="editable-cell" data-field="description" data-index="' + index + '">' + 
           risk.description + 
           '<div class="edit-hint">Nhấp đúp để chỉnh sửa</div>' +
@@ -12981,7 +13929,6 @@ function showEffortDetails() {
           risk.action + 
           '<div class="edit-hint">Nhấp đúp để chỉnh sửa</div>' +
         '</td>' +
-        '<td class="pic-info">' + (risk.pic || 'Unassigned') + '</td>' +
         '<td>' +
           '<button class="jira-btn" data-risk-index="' + index + '" data-description="' + 
           risk.description.replace(/"/g, '&quot;') + '" data-action="' + 
@@ -13038,8 +13985,388 @@ function showEffortDetails() {
     return '';
   }
   
-  // Generate detailed explanation based on score and level
-  function generateDetailedExplanation(risk) {
+  // Generate EXPLANATION (Tại sao có rủi ro này?) - TẬP TRUNG VÀO NGUYÊN NHÂN & DATA METRICS
+  function generateSimplifiedExplanation(risk) {
+    if (!jiraData || !jiraData.issues) {
+      return '<div style="color:#6B778C;">Chưa có dữ liệu để phân tích nguyên nhân</div>';
+    }
+    
+    const score = typeof risk.score === 'string' ? parseInt(risk.score) : risk.score;
+    const totalIssues = jiraData.issues.length;
+    const riskDesc = (risk.description || '').toLowerCase();
+    
+    let explanation = '';
+    
+    // Phát hiện LOẠI RỦI RO để phân tích nguyên nhân cụ thể
+    const isOverdueRisk = riskDesc.includes('quá hạn') || riskDesc.includes('overdue') || riskDesc.includes('delay');
+    const isBugRisk = riskDesc.includes('bug') || riskDesc.includes('chất lượng') || riskDesc.includes('quality');
+    const isWorkloadRisk = riskDesc.includes('workload') || riskDesc.includes('nhân sự') || riskDesc.includes('quá tải') || riskDesc.includes('overload');
+    const isPriorityRisk = riskDesc.includes('priority') || riskDesc.includes('ưu tiên');
+    const isStatusRisk = riskDesc.includes('blocked') || riskDesc.includes('in progress') || riskDesc.includes('trạng thái');
+    
+    // PHÂN TÍCH NGUYÊN NHÂN DựA VÀO DỮ LIỆU THỰC
+    const now = new Date();
+    
+    if (isOverdueRisk) {
+      // RỦI RO VỀ TIẾN ĐỘ - Phân tích nguyên nhân overdue
+      const overdueIssues = jiraData.issues.filter(i => {
+        const due = i.fields.duedate;
+        const status = i.fields.status?.name;
+        return due && new Date(due) < now && status !== 'Done' && status !== 'Closed';
+      });
+      const overdueCount = overdueIssues.length;
+      const overdueRate = totalIssues > 0 ? (overdueCount / totalIssues) * 100 : 0;
+      
+      explanation += '<strong>🔍 NGUYÊN NHÂN:</strong><br>';
+      explanation += '<div style="padding-left:12px;margin-top:6px;">';
+      explanation += '• <strong>Tỷ lệ quá hạn:</strong> ' + overdueRate.toFixed(1) + '% (' + overdueCount + '/' + totalIssues + ' tickets)<br>';
+      
+      if (overdueRate > 20) {
+        explanation += '• <strong>Phân tích:</strong> Tỷ lệ quá hạn RẤT CAO (>20%), có thể do:<br>';
+        explanation += '  - Estimation không chính xác (ước lượng thời gian quá lạc quan)<br>';
+        explanation += '  - Thiếu resource hoặc phân bổ không hợp lý<br>';
+        explanation += '  - Scope creep (yêu cầu tăng thêm trong quá trình thực hiện)<br>';
+      } else if (overdueRate > 10) {
+        explanation += '• <strong>Phân tích:</strong> Tỷ lệ quá hạn CAO (>10%), nguyên nhân có thể:<br>';
+        explanation += '  - Dependencies phức tạp giữa các tasks<br>';
+        explanation += '  - Thiếu daily tracking và adjustment<br>';
+      } else {
+        explanation += '• <strong>Phân tích:</strong> Tỷ lệ chấp nhận được, nhưng cần theo dõi<br>';
+      }
+      explanation += '</div>';
+      
+    } else if (isBugRisk) {
+      // RỦI RO VỀ CHẤT LƯỢNG - Phân tích nguyên nhân bugs
+      const issueTypeData = getIssueTypeDistribution();
+      const bugCount = issueTypeData['Bug'] || 0;
+      const bugRate = totalIssues > 0 ? (bugCount / totalIssues) * 100 : 0;
+      
+      explanation += '<strong>🔍 NGUYÊN NHÂN:</strong><br>';
+      explanation += '<div style="padding-left:12px;margin-top:6px;">';
+      explanation += '• <strong>Tỷ lệ bugs:</strong> ' + bugRate.toFixed(1) + '% (' + bugCount + '/' + totalIssues + ' tickets)<br>';
+      
+      if (bugRate > 25) {
+        explanation += '• <strong>Phân tích:</strong> Tỷ lệ bugs CỰC CAO (>25%), nguyên nhân chính:<br>';
+        explanation += '  - Code quality thấp, thiếu code review nghiêm túc<br>';
+        explanation += '  - Test coverage không đủ (unit test, integration test)<br>';
+        explanation += '  - Thiếu QA testing trước khi release<br>';
+        explanation += '  - Technical debt tích lũy quá nhiều<br>';
+      } else if (bugRate > 15) {
+        explanation += '• <strong>Phân tích:</strong> Tỷ lệ bugs CAO (>15%), cần cải thiện:<br>';
+        explanation += '  - Tăng cường code review và pair programming<br>';
+        explanation += '  - Bổ sung automated testing<br>';
+      } else {
+        explanation += '• <strong>Phân tích:</strong> Tỷ lệ bugs ở mức chấp nhận được<br>';
+      }
+      explanation += '</div>';
+      
+    } else if (isWorkloadRisk) {
+      // RỦI RO VỀ NHÂN SỰ - Phân tích workload distribution
+      const assigneeData = getAssigneeWorkload();
+      const assigneeCount = Object.keys(assigneeData).filter(k => k !== 'Unassigned').length;
+      const avgWorkload = assigneeCount > 0 ? totalIssues / assigneeCount : 0;
+      const maxWorkload = Math.max(...Object.values(assigneeData));
+      const minWorkload = Math.min(...Object.values(assigneeData).filter(v => v > 0));
+      const overloadedCount = Object.values(assigneeData).filter(count => count > avgWorkload * 1.5).length;
+      
+      explanation += '<strong>🔍 NGUYÊN NHÂN:</strong><br>';
+      explanation += '<div style="padding-left:12px;margin-top:6px;">';
+      explanation += '• <strong>Phân bổ công việc:</strong><br>';
+      explanation += '  - Trung bình: ' + avgWorkload.toFixed(1) + ' tickets/người<br>';
+      explanation += '  - Cao nhất: ' + maxWorkload + ' tickets (quá tải ' + ((maxWorkload/avgWorkload - 1) * 100).toFixed(0) + '%)<br>';
+      explanation += '  - Thấp nhất: ' + minWorkload + ' tickets<br>';
+      
+      if (overloadedCount > 0) {
+        explanation += '• <strong>Phân tích:</strong> Có ' + overloadedCount + ' nhân sự quá tải (>150% trung bình):<br>';
+        explanation += '  - Phân bổ công việc KHÔNG ĐỀU, thiếu load balancing<br>';
+        explanation += '  - Một số nhân sự có skill đặc biệt bị gán quá nhiều tasks<br>';
+        explanation += '  - Nguy cơ burnout, giảm năng suất và chất lượng<br>';
+      }
+      explanation += '</div>';
+      
+    } else if (isPriorityRisk) {
+      // RỦI RO VỀ PRIORITY - Phân tích priority distribution
+      const priorityData = getPriorityDistribution();
+      const criticalCount = (priorityData['Critical'] || 0) + (priorityData['Highest'] || 0);
+      const highCount = priorityData['High'] || 0;
+      const highPriorityCount = criticalCount + highCount;
+      const highPriorityRate = totalIssues > 0 ? (highPriorityCount / totalIssues) * 100 : 0;
+      
+      explanation += '<strong>🔍 NGUYÊN NHÂN:</strong><br>';
+      explanation += '<div style="padding-left:12px;margin-top:6px;">';
+      explanation += '• <strong>Phân bố priority:</strong><br>';
+      explanation += '  - Critical/Highest: ' + criticalCount + ' tickets<br>';
+      explanation += '  - High: ' + highCount + ' tickets<br>';
+      explanation += '  - Tổng High+: ' + highPriorityRate.toFixed(1) + '%<br>';
+      
+      if (highPriorityRate > 30) {
+        explanation += '• <strong>Phân tích:</strong> Quá nhiều high priority (>30%):<br>';
+        explanation += '  - Priority inflation - mọi thứ đều "urgent"<br>';
+        explanation += '  - Thiếu prioritization framework rõ ràng<br>';
+        explanation += '  - Scope creep hoặc requirement không ổn định<br>';
+        explanation += '  - Stakeholder pressure quá lớn<br>';
+      } else if (criticalCount > 5) {
+        explanation += '• <strong>Phân tích:</strong> Có ' + criticalCount + ' critical issues:<br>';
+        explanation += '  - Các vấn đề nghiêm trọng cần xử lý ngay<br>';
+        explanation += '  - Có thể block toàn bộ dự án nếu không resolve<br>';
+      }
+      explanation += '</div>';
+      
+    } else if (isStatusRisk) {
+      // RỦI RO VỀ STATUS - Phân tích status distribution
+      const statusData = getStatusDistribution();
+      const blockedCount = statusData['Blocked'] || 0;
+      const inProgressCount = statusData['In Progress'] || 0;
+      const todoCount = statusData['To Do'] || statusData['Open'] || 0;
+      const doneCount = statusData['Done'] || statusData['Closed'] || 0;
+      const inProgressRate = totalIssues > 0 ? (inProgressCount / totalIssues) * 100 : 0;
+      
+      explanation += '<strong>🔍 NGUYÊN NHÂN:</strong><br>';
+      explanation += '<div style="padding-left:12px;margin-top:6px;">';
+      explanation += '• <strong>Phân bố trạng thái:</strong><br>';
+      explanation += '  - Blocked: ' + blockedCount + ' tickets<br>';
+      explanation += '  - In Progress: ' + inProgressCount + ' (' + inProgressRate.toFixed(0) + '%)<br>';
+      explanation += '  - To Do: ' + todoCount + ' tickets<br>';
+      
+      if (blockedCount > 0) {
+        explanation += '• <strong>Phân tích blocked:</strong> ' + blockedCount + ' tickets bị chặn:<br>';
+        explanation += '  - Dependencies chưa hoàn thành<br>';
+        explanation += '  - Thiếu thông tin/quyết định từ stakeholder<br>';
+        explanation += '  - Technical blockers cần escalate<br>';
+      }
+      
+      if (inProgressRate > 40) {
+        explanation += '• <strong>Phân tích in-progress:</strong> Quá nhiều tasks đang làm song song:<br>';
+        explanation += '  - Team thiếu focus, làm nhiều thứ cùng lúc<br>';
+        explanation += '  - WIP (Work In Progress) limit không được tuân thủ<br>';
+        explanation += '  - Cần áp dụng Kanban principles để giảm multitasking<br>';
+      }
+      explanation += '</div>';
+      
+    } else {
+      // RỦI RO TỔNG HỢP - Phân tích tổng quan
+      explanation += '<strong>🔍 NGUYÊN NHÂN TỔNG HỢP:</strong><br>';
+      explanation += '<div style="padding-left:12px;margin-top:6px;">';
+      
+      // Overdue
+      const overdueIssues = jiraData.issues.filter(i => {
+        const due = i.fields.duedate;
+        const status = i.fields.status?.name;
+        return due && new Date(due) < now && status !== 'Done' && status !== 'Closed';
+      });
+      const overdueRate = totalIssues > 0 ? (overdueIssues.length / totalIssues) * 100 : 0;
+      
+      // Bugs
+      const issueTypeData = getIssueTypeDistribution();
+      const bugRate = totalIssues > 0 ? ((issueTypeData['Bug'] || 0) / totalIssues) * 100 : 0;
+      
+      // Priority
+      const priorityData = getPriorityDistribution();
+      const highPriorityCount = (priorityData['High'] || 0) + (priorityData['Highest'] || 0) + (priorityData['Critical'] || 0);
+      const highPriorityRate = totalIssues > 0 ? (highPriorityCount / totalIssues) * 100 : 0;
+      
+      explanation += '• <strong>Các chỉ số chính:</strong><br>';
+      explanation += '  - Overdue: ' + overdueRate.toFixed(1) + '% (' + overdueIssues.length + ' tickets)<br>';
+      explanation += '  - Bug rate: ' + bugRate.toFixed(1) + '% (' + (issueTypeData['Bug'] || 0) + ' tickets)<br>';
+      explanation += '  - High priority: ' + highPriorityRate.toFixed(1) + '% (' + highPriorityCount + ' tickets)<br>';
+      
+      // Phân tích tổng hợp
+      let issues = [];
+      if (overdueRate > 10) issues.push('Tiến độ chậm');
+      if (bugRate > 15) issues.push('Chất lượng thấp');
+      if (highPriorityRate > 30) issues.push('Priority không rõ ràng');
+      
+      if (issues.length > 0) {
+        explanation += '<br>• <strong>Vấn đề phát hiện:</strong> ' + issues.join(', ') + '<br>';
+        explanation += '  → Cần review lại process và resource allocation<br>';
+      } else {
+        explanation += '<br>• <strong>Đánh giá:</strong> Các chỉ số ở mức chấp nhận được<br>';
+      }
+      
+      explanation += '</div>';
+    }
+    
+    // Data summary moved to detailed info section, simplified here
+    return explanation;
+  }
+  
+  // Generate DETAILED BASIS & FORMULA (Căn cứ & Công thức tính điểm) - TIN AI SCORE + GIẢI THÍCH DATA THỰC
+  function generateDetailedInfo(risk) {
+    if (!jiraData || !jiraData.issues) return 'Chưa có dữ liệu';
+    
+    const score = typeof risk.score === 'string' ? parseInt(risk.score) : risk.score;
+    const totalIssues = jiraData.issues.length;
+    const riskDesc = (risk.description || '').toLowerCase();
+    
+    // BƯỚC 1: REVERSE ENGINEER từ AI score để tính Probability & Impact CHÍNH XÁC
+    // Tìm cặp P×I gần nhất với score
+    let probability = 1;
+    let probabilityLabel = 'Thấp';
+    let impact = 1;
+    let impactLabel = 'Thấp';
+    
+    // Tìm cặp P×I = score (hoặc gần nhất)
+    let bestDiff = 999;
+    for (let p = 1; p <= 5; p++) {
+      for (let i = 1; i <= 5; i++) {
+        const product = p * i;
+        const diff = Math.abs(product - score);
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          probability = p;
+          impact = i;
+        }
+      }
+    }
+    
+    // Set labels
+    if (probability === 5) probabilityLabel = 'Rất cao';
+    else if (probability === 4) probabilityLabel = 'Cao';
+    else if (probability === 3) probabilityLabel = 'Trung bình';
+    else if (probability === 2) probabilityLabel = 'Thấp-TB';
+    else probabilityLabel = 'Thấp';
+    
+    if (impact === 5) impactLabel = 'Rất cao';
+    else if (impact === 4) impactLabel = 'Cao';
+    else if (impact === 3) impactLabel = 'Trung bình';
+    else if (impact === 2) impactLabel = 'Thấp-TB';
+    else impactLabel = 'Thấp';
+    
+    // BƯỚC 2: Phân tích data thực để GIẢI THÍCH tại sao có P & I như vậy
+    const isOverdueRisk = riskDesc.includes('quá hạn') || riskDesc.includes('overdue') || riskDesc.includes('delay');
+    const isBugRisk = riskDesc.includes('bug') || riskDesc.includes('chất lượng') || riskDesc.includes('quality');
+    const isWorkloadRisk = riskDesc.includes('workload') || riskDesc.includes('nhân sự') || riskDesc.includes('quá tải') || riskDesc.includes('overload');
+    const isPriorityRisk = riskDesc.includes('priority') || riskDesc.includes('ưu tiên');
+    
+    const now = new Date();
+    let probabilityReason = '';
+    let impactReason = '';
+    
+    // Phân tích data để GIẢI THÍCH (không tính lại score)
+    if (isOverdueRisk) {
+      // Rủi ro về overdue - Giải thích từ data
+      const overdueIssues = jiraData.issues.filter(i => {
+        const due = i.fields.duedate;
+        const status = i.fields.status?.name;
+        return due && new Date(due) < now && status !== 'Done' && status !== 'Closed';
+      });
+      const overdueCount = overdueIssues.length;
+      const overdueRate = totalIssues > 0 ? (overdueCount / totalIssues) * 100 : 0;
+      
+      probabilityReason = 'Overdue rate: ' + overdueRate.toFixed(1) + '% (' + overdueCount + '/' + totalIssues + ' tickets)';
+      if (overdueRate > 15) probabilityReason += ' - Vượt ngưỡng an toàn 15%';
+      
+      impactReason = overdueCount + ' tickets quá hạn ảnh hưởng tiến độ';
+      if (overdueCount > 20) impactReason += ', nguy cơ delay milestone';
+      
+    } else if (isBugRisk) {
+      // Rủi ro về bug/quality - Giải thích từ data
+      const issueTypeData = getIssueTypeDistribution();
+      const bugCount = issueTypeData['Bug'] || 0;
+      const bugRate = totalIssues > 0 ? (bugCount / totalIssues) * 100 : 0;
+      
+      probabilityReason = 'Bug rate: ' + bugRate.toFixed(1) + '% (' + bugCount + '/' + totalIssues + ' tickets)';
+      if (bugRate > 20) probabilityReason += ' - Vượt ngưỡng 20%, chất lượng code cần cải thiện';
+      
+      impactReason = bugCount + ' bugs ảnh hưởng chất lượng sản phẩm';
+      if (bugCount > 30) impactReason += ', nguy cơ ảnh hưởng UX và customer satisfaction';
+      
+    } else if (isWorkloadRisk) {
+      // Rủi ro về workload - Giải thích từ data
+      const assigneeData = getAssigneeWorkload();
+      const assigneeCount = Object.keys(assigneeData).filter(k => k !== 'Unassigned').length;
+      const avgWorkload = assigneeCount > 0 ? totalIssues / assigneeCount : 0;
+      const maxWorkload = Math.max(...Object.values(assigneeData));
+      const overloadedCount = Object.values(assigneeData).filter(count => count > avgWorkload * 1.5).length;
+      
+      probabilityReason = overloadedCount + ' nhân sự quá tải (>' + (avgWorkload * 1.5).toFixed(0) + ' tickets), max: ' + maxWorkload + ' tickets';
+      if (overloadedCount > 3) probabilityReason += ' - Phân bổ công việc không đều';
+      
+      impactReason = 'Nguy cơ burnout, giảm năng suất và chất lượng công việc';
+      if (maxWorkload > 30) impactReason += ', có thể dẫn đến turnover';
+      
+    } else if (isPriorityRisk) {
+      // Rủi ro về priority - Giải thích từ data
+      const priorityData = getPriorityDistribution();
+      const criticalCount = (priorityData['Critical'] || 0) + (priorityData['Highest'] || 0);
+      const highPriorityCount = (priorityData['High'] || 0) + criticalCount;
+      const highPriorityRate = totalIssues > 0 ? (highPriorityCount / totalIssues) * 100 : 0;
+      
+      probabilityReason = 'High priority: ' + highPriorityRate.toFixed(1) + '% (' + highPriorityCount + '/' + totalIssues + ' tickets)';
+      if (highPriorityRate > 30) probabilityReason += ' - Có thể do scope creep hoặc prioritization không chính xác';
+      
+      impactReason = criticalCount + ' critical + ' + (highPriorityCount - criticalCount) + ' high priority';
+      if (criticalCount > 5) impactReason += ', ảnh hưởng nghiêm trọng đến milestone';
+      
+    } else {
+      // Rủi ro tổng quát - Phân tích CỤ THỂ từ data
+      const overdueIssues = jiraData.issues.filter(i => {
+        const due = i.fields.duedate;
+        const status = i.fields.status?.name;
+        return due && new Date(due) < now && status !== 'Done' && status !== 'Closed';
+      });
+      const overdueRate = totalIssues > 0 ? (overdueIssues.length / totalIssues) * 100 : 0;
+      
+      const issueTypeData = getIssueTypeDistribution();
+      const bugCount = issueTypeData['Bug'] || 0;
+      const bugRate = totalIssues > 0 ? (bugCount / totalIssues) * 100 : 0;
+      
+      const priorityData = getPriorityDistribution();
+      const highPriorityCount = (priorityData['High'] || 0) + (priorityData['Highest'] || 0) + (priorityData['Critical'] || 0);
+      const highPriorityRate = totalIssues > 0 ? (highPriorityCount / totalIssues) * 100 : 0;
+      
+      // Tổng hợp các chỉ số
+      let factors = [];
+      if (overdueRate > 5) factors.push('Overdue ' + overdueRate.toFixed(1) + '%');
+      if (bugRate > 10) factors.push('Bug ' + bugRate.toFixed(1) + '%');
+      if (highPriorityRate > 20) factors.push('High priority ' + highPriorityRate.toFixed(1) + '%');
+      
+      if (factors.length > 0) {
+        probabilityReason = 'Tổng hợp: ' + factors.join(', ');
+      } else {
+        probabilityReason = 'Dự án ổn định: Overdue ' + overdueRate.toFixed(1) + '%, Bug ' + bugRate.toFixed(1) + '%';
+      }
+      
+      impactReason = 'AI đánh giá dựa trên ' + totalIssues + ' tickets: ' + overdueIssues.length + ' overdue, ' + bugCount + ' bugs, ' + highPriorityCount + ' high priority';
+    }
+    
+    let info = '';
+    
+    // CÔNG THỨC - CHÍNH XÁC
+    const calculatedScore = probability * impact;
+    const scoreMatch = calculatedScore === score;
+    
+    info += '<div style="background:#fff3cd;padding:8px;border-radius:6px;margin-bottom:8px;border-left:3px solid #f59e0b;">';
+    info += '<strong>📐 Công thức:</strong><br>';
+    info += '<code style="background:#fff;padding:4px 8px;border-radius:4px;font-size:13px;">';
+    info += 'Score = Probability × Impact';
+    info += '</code><br>';
+    info += '<strong style="color:#d97706;font-size:15px;">' + probability + ' × ' + impact + ' = ' + calculatedScore + ' điểm</strong>';
+    
+    if (!scoreMatch) {
+      info += ' <span style="font-size:11px;color:#dc2626;">(AI: ' + score + ', diff: ±' + Math.abs(calculatedScore - score) + ')</span>';
+    } else {
+      info += ' <span style="font-size:10px;color:#059669;">✓ Khớp với AI</span>';
+    }
+    info += '</div>';
+    
+    // CĂN CỨ CỤ THỂ TỪ DATA THỰC
+    info += '<div style="font-size:11px;line-height:1.6;">';
+    info += '<strong>📊 Căn cứ từ dữ liệu thực:</strong><br>';
+    info += '• <strong>Probability (' + probability + ' - ' + probabilityLabel + '):</strong><br>';
+    info += '  → ' + probabilityReason + '<br><br>';
+    
+    info += '• <strong>Impact (' + impact + ' - ' + impactLabel + '):</strong><br>';
+    info += '  → ' + impactReason + '<br><br>';
+    
+    info += '• <strong>Nguồn:</strong> ' + totalIssues.toLocaleString() + ' tickets từ Jira';
+    info += '</div>';
+    
+    return info;
+  }
+  
+  // Generate detailed explanation based on score and level (OLD - for reference)
+  function generateDetailedExplanationOld(risk) {
     const score = typeof risk.score === 'string' ? parseInt(risk.score) : risk.score;
     const level = (risk.level || '').toLowerCase();
     const totalIssues = jiraData ? jiraData.issues.length : 0;
@@ -13354,8 +14681,9 @@ function showEffortDetails() {
     
     // Populate modal content
     document.getElementById('confirmProjectKey').textContent = ticketData.projectKey;
-    document.getElementById('confirmSummary').textContent = ticketData.summary;
-    document.getElementById('confirmDescription').textContent = ticketData.description;
+    document.getElementById('confirmParentKey').value = ticketData.parentKey || '';
+    document.getElementById('confirmSummary').value = ticketData.summary;
+    document.getElementById('confirmDescription').value = ticketData.description;
     
     // Calculate due date
     const dueDate = new Date();
@@ -13395,6 +14723,11 @@ function showEffortDetails() {
     const button = pendingTicketData.button;
     const originalContent = pendingTicketData.originalContent;
     
+    // Get edited values from modal
+    const editedSummary = document.getElementById('confirmSummary').value;
+    const editedDescription = document.getElementById('confirmDescription').value;
+    const parentKey = document.getElementById('confirmParentKey').value.trim();
+    
     // Close modal
     modal.style.display = 'none';
     
@@ -13407,8 +14740,9 @@ function showEffortDetails() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           projectKey: pendingTicketData.projectKey,
-          summary: pendingTicketData.summary,
-          description: pendingTicketData.description,
+          summary: editedSummary,
+          description: editedDescription,
+          parentKey: parentKey || null,
           issueType: pendingTicketData.issueType,
           riskData: pendingTicketData.riskData
         })
@@ -13680,6 +15014,469 @@ function showEffortDetails() {
       cancelTicketCreation();
     }
   });
+  
+  // KPI Expansion handlers
+  document.querySelectorAll('.kpi-expand-btn').forEach(btn => {
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      const kpiType = this.getAttribute('data-kpi');
+      const listId = kpiType + 'List';
+      const listEl = document.getElementById(listId);
+      const icon = this.querySelector('i');
+      
+      if (listEl.style.display === 'none') {
+        // Show list
+        listEl.style.display = 'block';
+        icon.className = 'fas fa-chevron-up';
+        
+        // Render tickets
+        if (kpiType === 'sprintDelay' && window.sprintDelayTickets) {
+          renderTicketList(listEl, window.sprintDelayTickets, 'sprint');
+        } else if (kpiType === 'overdue' && window.overdueTickets) {
+          renderTicketList(listEl, window.overdueTickets, 'overdue');
+        }
+      } else {
+        // Hide list
+        listEl.style.display = 'none';
+        icon.className = 'fas fa-chevron-down';
+      }
+    });
+  });
+  
+  function renderTicketList(containerEl, tickets, type) {
+    if (!tickets || tickets.length === 0) {
+      containerEl.innerHTML = '<div style="font-size: 12px; color: #6B778C; text-align: center;">Không có ticket</div>';
+      return;
+    }
+    
+    const now = new Date();
+    let html = '<table class="table issue-details-table" style="font-size: 11px;">';
+    html += '<thead><tr>';
+    html += '<th style="padding: 6px;">Key</th>';
+    html += '<th style="padding: 6px;">Summary</th>';
+    html += '<th style="padding: 6px;">Status</th>';
+    html += '<th style="padding: 6px;">Assignee</th>';
+    
+    if (type === 'overdue') {
+      html += '<th style="padding: 6px;">Trễ (ngày)</th>';
+    } else if (type === 'sprint') {
+      html += '<th style="padding: 6px;">Sprint</th>';
+    }
+    
+    html += '</tr></thead><tbody>';
+    
+    tickets.slice(0, 20).forEach(issue => {
+      const key = issue.key || '';
+      const summary = (issue.fields.summary || '').substring(0, 40);
+      const status = issue.fields.status?.name || '';
+      const assignee = issue.fields.assignee?.displayName || 'Unassigned';
+      
+      html += '<tr>';
+      html += '<td style="padding: 4px;"><strong>' + key + '</strong></td>';
+      html += '<td style="padding: 4px;">' + summary + '...</td>';
+      html += '<td style="padding: 4px;"><span class="status-badge">' + status + '</span></td>';
+      html += '<td style="padding: 4px;">' + assignee + '</td>';
+      
+      if (type === 'overdue') {
+        const duedate = issue.fields.duedate;
+        if (duedate) {
+          const dueDateObj = new Date(duedate);
+          const diffTime = now - dueDateObj;
+          const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+          html += '<td style="padding: 4px; color: #dc2626; font-weight: 600;">' + diffDays + ' ngày</td>';
+        } else {
+          html += '<td style="padding: 4px;">-</td>';
+        }
+      } else if (type === 'sprint') {
+        const sprint = issue.fields.sprint;
+        html += '<td style="padding: 4px;">' + (sprint?.name || '-') + '</td>';
+      }
+      
+      html += '</tr>';
+    });
+    
+    if (tickets.length > 20) {
+      html += '<tr><td colspan="5" style="text-align: center; color: #6B778C; padding: 6px;">... và ' + (tickets.length - 20) + ' tickets khác</td></tr>';
+    }
+    
+    html += '</tbody></table>';
+    containerEl.innerHTML = html;
+  }
+  
+  // ====== TIME RANGE QUICK SELECT ======
+  const timeRangeBtns = document.querySelectorAll('.time-range-btn');
+  const customDateRange = document.getElementById('customDateRange');
+  const customRangeBtn = document.getElementById('customRangeBtn');
+  
+  let selectedRange = '3m'; // Default
+  
+  function setDateRange(range) {
+    const today = new Date();
+    let startDate = new Date();
+    
+    if (range === '7d') {
+      startDate.setDate(today.getDate() - 7);
+    } else if (range === '30d') {
+      startDate.setDate(today.getDate() - 30);
+    } else if (range === '3m') {
+      startDate.setMonth(today.getMonth() - 3);
+    } else if (range === '6m') {
+      startDate.setMonth(today.getMonth() - 6);
+    } else if (range === 'custom') {
+      // Show custom date range panel
+      if (customDateRange) {
+        customDateRange.style.display = 'block';
+      }
+      return; // Don't auto-set dates for custom
+    }
+    
+    // Hide custom panel for preset ranges
+    if (customDateRange) {
+      customDateRange.style.display = 'none';
+    }
+    
+    // Set date inputs
+    if (startDateInput) {
+      startDateInput.value = startDate.toISOString().split('T')[0];
+    }
+    if (endDateInput) {
+      endDateInput.value = today.toISOString().split('T')[0];
+    }
+  }
+  
+  timeRangeBtns.forEach(btn => {
+    btn.addEventListener('click', function() {
+      // Remove active from all
+      timeRangeBtns.forEach(b => b.classList.remove('active'));
+      // Add active to clicked
+      this.classList.add('active');
+      
+      // Set date range
+      const range = this.getAttribute('data-range');
+      selectedRange = range;
+      setDateRange(range);
+    });
+  });
+  
+  // ====== EXPORT PDF & DOCX FUNCTIONS ======
+  
+  // Helper: Categorize risks into groups (AI Auto-categorize into 3 main categories)
+  function categorizeRisks(risks) {
+    const categories = {
+      nhansu: { name: 'Nhân sự', icon: '👥', color: '#3b82f6', risks: [] },
+      tiendo: { name: 'Tiến độ', icon: '⏰', color: '#f59e0b', risks: [] },
+      chatluong: { name: 'Chất lượng', icon: '🐛', color: '#ef4444', risks: [] }
+    };
+    
+    risks.forEach(risk => {
+      const desc = (risk.description || '').toLowerCase();
+      const action = (risk.action || '').toLowerCase();
+      const combined = desc + ' ' + action;
+      
+      // Nhân sự keywords (Personnel/HR/Workload)
+      const nhansuKeywords = [
+        'nhân sự', 'workload', 'quá tải', 'assignee', 'phân công', 
+        'effort', 'resource', 'người', 'thành viên', 'team',
+        'burnout', 'overload', 'distribute', 'assign', 'staff'
+      ];
+      
+      // Tiến độ keywords (Schedule/Timeline/Delay)
+      const tiendoKeywords = [
+        'tiến độ', 'quá hạn', 'overdue', 'delay', 'deadline',
+        'schedule', 'timeline', 'late', 'behind', 'sprint',
+        'due date', 'blocked', 'chậm', 'trễ', 'kịp'
+      ];
+      
+      // Chất lượng keywords (Quality/Bug/Test)
+      const chatluongKeywords = [
+        'chất lượng', 'bug', 'quality', 'test', 'lỗi',
+        'defect', 'issue', 'critical', 'high priority',
+        'regression', 'fix', 'error', 'failed'
+      ];
+      
+      // Auto-categorize based on keywords (priority order: Quality > Schedule > Personnel)
+      let categorized = false;
+      
+      // Check Chất lượng first (highest priority for business)
+      if (chatluongKeywords.some(kw => combined.includes(kw))) {
+        categories.chatluong.risks.push(risk);
+        categorized = true;
+      }
+      // Then check Tiến độ
+      else if (tiendoKeywords.some(kw => combined.includes(kw))) {
+        categories.tiendo.risks.push(risk);
+        categorized = true;
+      }
+      // Finally check Nhân sự
+      else if (nhansuKeywords.some(kw => combined.includes(kw))) {
+        categories.nhansu.risks.push(risk);
+        categorized = true;
+      }
+      
+      // Default: if not categorized, put in most relevant based on risk level
+      if (!categorized) {
+        const level = (risk.level || '').toLowerCase();
+        if (level === 'extreme' || level === 'high') {
+          categories.chatluong.risks.push(risk); // High risks default to Quality
+        } else {
+          categories.tiendo.risks.push(risk); // Medium/Low risks default to Schedule
+        }
+      }
+    });
+    
+    return categories;
+  }
+  
+  // Export PDF function - MULTI-PAGE SUPPORT with auto pagination
+  async function exportToPDF() {
+    if (!currentRisks || currentRisks.length === 0) {
+      alert('Chưa có dữ liệu phân tích rủi ro. Vui lòng bấm "Generate Risk Analysis" trước.');
+      return;
+    }
+    
+    try {
+      // Show loading indicator
+      const exportBtn = document.getElementById('exportPdfBtn');
+      const originalText = exportBtn.innerHTML;
+      exportBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> <span>Đang tạo PDF...</span>';
+      exportBtn.disabled = true;
+      
+      // Categorize risks
+      const categories = categorizeRisks(currentRisks);
+      
+      // Calculate statistics
+      const extremeCount = currentRisks.filter(r => r.level.toLowerCase() === 'extreme').length;
+      const highCount = currentRisks.filter(r => r.level.toLowerCase() === 'high').length;
+      const mediumCount = currentRisks.filter(r => r.level.toLowerCase() === 'medium').length;
+      const lowCount = currentRisks.filter(r => r.level.toLowerCase() === 'low').length;
+      
+      // Populate PDF template
+      const pdfTemplate = document.getElementById('pdfTemplate');
+      
+      // Update header info
+      document.getElementById('pdf-project-name').textContent = currentProjectKey || 'Tất cả dự án';
+      document.getElementById('pdf-date').textContent = new Date().toLocaleDateString('vi-VN');
+      document.getElementById('pdf-total-risks').textContent = currentRisks.length + ' rủi ro';
+      
+      // Update statistics
+      document.getElementById('pdf-extreme-count').textContent = extremeCount;
+      document.getElementById('pdf-high-count').textContent = highCount;
+      document.getElementById('pdf-medium-count').textContent = mediumCount;
+      document.getElementById('pdf-low-count').textContent = lowCount;
+      
+      // Populate 3 sections
+      ['nhansu', 'tiendo', 'chatluong'].forEach(catKey => {
+        const category = categories[catKey];
+        const section = pdfTemplate.querySelector('.pdf-section[data-category="' + catKey + '"]');
+        const container = section.querySelector('.pdf-risks-container');
+        const countSpan = section.querySelector('.section-count');
+        
+        // Update count
+        countSpan.textContent = category.risks.length + ' rủi ro';
+        
+        // Clear container
+        container.innerHTML = '';
+        
+        if (category.risks.length === 0) {
+          container.innerHTML = '<div style="font-size: 11px; color: #94a3b8; text-align: center; padding: 16px;">Không có rủi ro</div>';
+        } else {
+          // Add risks
+          category.risks.forEach((risk, index) => {
+            const riskHTML = createPDFRiskItem(risk, index);
+            container.innerHTML += riskHTML;
+          });
+        }
+      });
+      
+      // Temporarily show template for capture
+      pdfTemplate.style.left = '0';
+      pdfTemplate.style.top = '0';
+      pdfTemplate.style.visibility = 'visible';
+      
+      // Wait for fonts to load
+      await document.fonts.ready;
+      
+      // Capture FULL content with auto height
+      const contentDiv = pdfTemplate.querySelector('div');
+      const canvas = await html2canvas(contentDiv, {
+        scale: 3,
+        useCORS: true,
+        logging: false,
+        backgroundColor: '#ffffff',
+        windowWidth: 1123
+        // Remove fixed windowHeight to capture all content
+      });
+      
+      // Hide template again
+      pdfTemplate.style.left = '-9999px';
+      pdfTemplate.style.top = '-9999px';
+      pdfTemplate.style.visibility = 'hidden';
+      
+      // Initialize PDF
+      const { jsPDF } = window.jspdf;
+      const pdf = new jsPDF({
+        orientation: 'landscape',
+        unit: 'mm',
+        format: 'a4'
+      });
+      
+      const pdfWidth = pdf.internal.pageSize.getWidth(); // 297mm
+      const pdfHeight = pdf.internal.pageSize.getHeight(); // 210mm
+      
+      // Calculate dimensions
+      const imgWidth = canvas.width;
+      const imgHeight = canvas.height;
+      const ratio = imgWidth / imgHeight;
+      
+      // A4 landscape dimensions in pixels (at 96 DPI with scale 3)
+      const pageHeightPx = (794 * 3); // 2382px at scale 3
+      const pageWidthPx = (1123 * 3); // 3369px at scale 3
+      
+      // Calculate number of pages needed
+      const totalPages = Math.ceil(imgHeight / pageHeightPx);
+      
+      console.log('Generating ' + totalPages + ' page(s)...');
+      
+      // Generate each page
+      for (let page = 0; page < totalPages; page++) {
+        if (page > 0) {
+          pdf.addPage();
+        }
+        
+        // Calculate Y position for this page
+        const yPosition = page * pageHeightPx;
+        const remainingHeight = imgHeight - yPosition;
+        const pageHeight = Math.min(pageHeightPx, remainingHeight);
+        
+        // Create temporary canvas for this page slice
+        const pageCanvas = document.createElement('canvas');
+        pageCanvas.width = imgWidth;
+        pageCanvas.height = pageHeight;
+        const ctx = pageCanvas.getContext('2d');
+        
+        // Draw the slice of the original canvas
+        ctx.drawImage(
+          canvas,
+          0, yPosition,           // Source x, y
+          imgWidth, pageHeight,   // Source width, height
+          0, 0,                   // Dest x, y
+          imgWidth, pageHeight    // Dest width, height
+        );
+        
+        // Convert to image and add to PDF
+        const pageImgData = pageCanvas.toDataURL('image/png');
+        
+        // Calculate proper height for this page (especially for last page)
+        const actualPageHeight = (pageHeight / pageHeightPx) * pdfHeight;
+        
+        // Add image with proper dimensions (no stretching)
+        if (page === totalPages - 1 && remainingHeight < pageHeightPx) {
+          // Last page with remaining content - fit to actual height
+          pdf.addImage(pageImgData, 'PNG', 0, 0, pdfWidth, actualPageHeight);
+        } else {
+          // Full page
+          pdf.addImage(pageImgData, 'PNG', 0, 0, pdfWidth, pdfHeight);
+        }
+        
+        console.log('Page ' + (page + 1) + '/' + totalPages + ' added');
+      }
+      
+      // Save PDF
+      const safeProjectKey = (currentProjectKey || 'All').replace(/[^a-zA-Z0-9]/g, '_');
+      const fileName = 'BaoCaoRuiRo_' + safeProjectKey + '_' + 
+                      new Date().toISOString().split('T')[0] + '.pdf';
+      pdf.save(fileName);
+      
+      // Restore button
+      exportBtn.innerHTML = originalText;
+      exportBtn.disabled = false;
+      
+      console.log('PDF exported successfully with ' + totalPages + ' page(s)!');
+      
+    } catch (error) {
+      console.error('Export PDF error:', error);
+      alert('Lỗi khi export PDF: ' + error.message);
+      
+      // Restore button
+      const exportBtn = document.getElementById('exportPdfBtn');
+      if (exportBtn) {
+        exportBtn.innerHTML = '<i class="fas fa-file-pdf"></i> <span>Export PDF</span>';
+        exportBtn.disabled = false;
+      }
+    }
+  }
+  
+  // Helper: Create risk item HTML for PDF - OPTIMIZED for maximum content visibility
+  function createPDFRiskItem(risk, index) {
+    const level = risk.level.toLowerCase();
+    let bgGradient = 'linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%)';
+    let borderColor = '#cbd5e1';
+    let levelColor = '#64748b';
+    let badgeBg = '#94a3b8';
+    let shadowColor = 'rgba(148,163,184,0.12)';
+    
+    if (level === 'extreme') {
+      bgGradient = 'linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%)';
+      borderColor = '#fca5a5';
+      levelColor = '#dc2626';
+      badgeBg = '#dc2626';
+      shadowColor = 'rgba(220,38,38,0.15)';
+    } else if (level === 'high') {
+      bgGradient = 'linear-gradient(135deg, #fff1f2 0%, #ffe4e6 100%)';
+      borderColor = '#fda4af';
+      levelColor = '#ef4444';
+      badgeBg = '#ef4444';
+      shadowColor = 'rgba(239,68,68,0.15)';
+    } else if (level === 'medium') {
+      bgGradient = 'linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%)';
+      borderColor = '#fcd34d';
+      levelColor = '#f59e0b';
+      badgeBg = '#f59e0b';
+      shadowColor = 'rgba(245,158,11,0.15)';
+    } else {
+      bgGradient = 'linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%)';
+      borderColor = '#86efac';
+      levelColor = '#22c55e';
+      badgeBg = '#22c55e';
+      shadowColor = 'rgba(34,197,94,0.12)';
+    }
+    
+    const description = stripHTML(risk.description || '').substring(0, 200);
+    const action = stripHTML(risk.action || '').substring(0, 180);
+    
+    return '<div style="background: ' + bgGradient + '; border: 2px solid ' + borderColor + '; border-radius: 7px; padding: 9px 11px; margin-bottom: 7px; box-shadow: 0 1px 3px ' + shadowColor + ';">' +
+      '<div style="display: flex; align-items: flex-start; gap: 9px;">' +
+        '<div style="background: ' + badgeBg + '; color: white; min-width: 30px; height: 30px; border-radius: 7px; display: flex; align-items: center; justify-content: center; font-weight: 900; font-size: 13px; flex-shrink: 0; box-shadow: 0 2px 5px rgba(0,0,0,0.15); letter-spacing: -0.3px;">' +
+          risk.score +
+        '</div>' +
+        '<div style="flex: 1; min-width: 0;">' +
+          '<div style="font-size: 10px; font-weight: 800; color: ' + levelColor + '; text-transform: uppercase; margin-bottom: 4px; letter-spacing: 0.7px;">' +
+            risk.level +
+          '</div>' +
+          '<div style="font-size: 13px; font-weight: 700; color: #0f172a; margin-bottom: 4px; line-height: 1.5; word-wrap: break-word;">' +
+            description + (description.length >= 200 ? '...' : '') +
+          '</div>' +
+          '<div style="font-size: 12px; color: #475569; line-height: 1.5; font-weight: 600; word-wrap: break-word;">' +
+            '<span style="color: #1e293b; font-weight: 800;">▸</span> ' + action + (action.length >= 180 ? '...' : '') +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  }
+  
+  // Helper: Strip HTML tags
+  function stripHTML(html) {
+    const tmp = document.createElement('div');
+    tmp.innerHTML = html || '';
+    return tmp.textContent || tmp.innerText || '';
+  }
+  
+  // Event listeners for export buttons
+  const exportPdfBtn = document.getElementById('exportPdfBtn');
+  
+  if (exportPdfBtn) {
+    exportPdfBtn.addEventListener('click', exportToPDF);
+  }
   
   // Load projects khi trang load
   loadProjects();
@@ -17613,7 +19410,7 @@ if (req.method === 'GET' && url.pathname === '/api/confluence-spaces') {
 // Get Jira Issues
 if (req.method === 'POST' && url.pathname === '/api/jira-issues') {
   try {
-    const { projectKey } = await safeJson(req);
+    const { projectKey, startDate, endDate } = await safeJson(req);
     
     if (!projectKey) {
       return json({ ok: false, error: 'Missing projectKey' }, 400);
@@ -17628,48 +19425,89 @@ if (req.method === 'POST' && url.pathname === '/api/jira-issues') {
     
     const BASE_JIRA = envJiraBase(env);
     
-    // Build JQL query - đơn giản hơn để test
-    const jql = `project = ${projectKey}`;
+    // Build JQL query với date filter
+    let jql = `project = ${projectKey}`;
+    
+    if (startDate) {
+      jql += ` AND created >= "${startDate}"`;
+    }
+    if (endDate) {
+      jql += ` AND created <= "${endDate}"`;
+    }
+    
     console.log('JQL Query:', jql);
     
+    // API MỚI: /rest/api/3/search/jql với nextPageToken pagination
     const API_URL = `${BASE_JIRA}/rest/api/3/search/jql`;
     console.log('API URL:', API_URL);
     
-    const requestBody = {
-      jql: jql,
-      maxResults: 1000,
-      fields: ['key', 'summary', 'status', 'issuetype', 'priority', 'created', 'updated', 'duedate', 'assignee']
-    };
-    console.log('Request body:', JSON.stringify(requestBody, null, 2));
+    // PAGINATION: Dùng nextPageToken thay vì startAt (API mới)
+    const allIssues = [];
+    let nextPageToken = null;
+    const maxResults = 100; // Jira API thường giới hạn 100 per request
     
-    const response = await fetch(API_URL, {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Basic ' + btoa(`${email}:${apiToken}`),
-        'Accept': 'application/json',
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(requestBody)
-    });
+    do {
+      const requestBody = {
+        jql: jql,
+        maxResults: maxResults,
+        fields: ['key', 'summary', 'status', 'issuetype', 'priority', 'created', 'updated', 'duedate', 'assignee', 'customfield_10016']
+      };
+      
+      // Thêm nextPageToken nếu có (cho trang tiếp theo)
+      if (nextPageToken) {
+        requestBody.nextPageToken = nextPageToken;
+      }
+      
+      console.log(`Fetching issues: page ${allIssues.length / maxResults + 1}, nextPageToken=${nextPageToken || 'null'}`);
+      
+      const response = await fetch(API_URL, {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Basic ' + btoa(`${email}:${apiToken}`),
+          'Accept': 'application/json',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(requestBody)
+      });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('Jira API error response:', errorText);
+        throw new Error(`Jira API error: ${response.status} - ${errorText}`);
+      }
+      
+      const data = await response.json();
+      const issues = data.issues || [];
+      
+      console.log(`Received ${issues.length} issues (total so far: ${allIssues.length + issues.length})`);
+      
+      allIssues.push(...issues);
+      
+      // Lấy nextPageToken cho trang tiếp theo
+      nextPageToken = data.nextPageToken || null;
+      
+      // Kiểm tra isLast hoặc không còn issues
+      const isLast = data.isLast || issues.length === 0;
+      
+      // Safety: Nếu lấy quá 5000 issues thì dừng
+      if (allIssues.length >= 5000) {
+        console.warn('Reached 5000 issues limit, stopping pagination');
+        break;
+      }
+      
+      // Dừng nếu đã hết data
+      if (isLast || !nextPageToken) {
+        break;
+      }
+      
+    } while (true);
     
-    console.log('Response status:', response.status);
-    console.log('Response headers:', Object.fromEntries(response.headers.entries()));
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('Jira API error response:', errorText);
-      throw new Error(`Jira API error: ${response.status} - ${errorText}`);
-    }
-    
-    const data = await response.json();
-    console.log('Response data:', JSON.stringify(data, null, 2));
-    const issues = data.issues || [];
-    console.log('Issues count:', issues.length);
+    console.log('Total issues loaded:', allIssues.length);
     
     // Process data for charts
-    const processedData = processJiraDataForCharts(issues);
+    const processedData = processJiraDataForCharts(allIssues);
     
-    return json({ ok: true, issues, ...processedData });
+    return json({ ok: true, issues: allIssues, total: allIssues.length, ...processedData });
     
   } catch (err) {
     console.error('Jira issues error:', err);
@@ -18078,7 +19916,7 @@ if (req.method === 'POST' && url.pathname === '/api/analyze-risk-fields') {
 // === JIRA TICKET CREATION API ===
 if (req.method === 'POST' && url.pathname === '/api/create-jira-ticket') {
   try {
-    const { projectKey, summary, description, issueType, riskData } = await safeJson(req);
+    const { projectKey, summary, description, issueType, riskData, parentKey } = await safeJson(req);
     
     if (!projectKey || !summary || !description) {
       return json({ ok: false, error: 'Missing required parameters' }, 400);
@@ -18165,6 +20003,11 @@ if (req.method === 'POST' && url.pathname === '/api/create-jira-ticket') {
     // Thêm assignee nếu có
     if (assigneeAccountId) {
       createTicketPayload.fields.assignee = { accountId: assigneeAccountId };
+    }
+    
+    // Thêm parent key nếu có (để gắn vào Epic/Story)
+    if (parentKey) {
+      createTicketPayload.fields.parent = { key: parentKey };
     }
     
     const createResponse = await fetch(`${BASE_JIRA}/rest/api/3/issue`, {
@@ -18639,8 +20482,9 @@ if (req.method === 'POST' && url.pathname === '/zalo/webhook') {
       ctx.waitUntil(saveContact(env, chatId, senderName).catch(e => console.error('saveContact', e)));
     }
 
-    // LỆNH: /id
-    if (text && /^\/?id$/i.test(String(text).trim())) {
+    // LỆNH: /id hoặc /Id hoặc id hoặc Id (case-insensitive, xử lý khoảng trắng)
+    const normalizedText = String(text).trim().toLowerCase().replace(/\s+/g, '');
+    if (normalizedText === 'id' || normalizedText === '/id') {
       await zaloSendMessage(env, chatId, `Chat ID của bạn: ${chatId}`);
       return json({ ok: true, echoed: true });
     }
